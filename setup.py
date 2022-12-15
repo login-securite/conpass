@@ -26,7 +26,8 @@ setup(
     license="MIT",
     install_requires=[
         'python-ldap',
-        'impacket'
+        'impacket',
+        'rich'
     ],
     python_requires='>=3.6',
     classifiers=[

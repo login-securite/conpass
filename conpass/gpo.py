@@ -1,7 +1,5 @@
 import re
 
-from lsassy.impacketfile import ImpacketFile
-
 class GPO:
     GPLINK_OPT_DISABLE = 1 << 0
     GPLINK_OPT_ENFORCE = 1 << 1
