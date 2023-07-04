@@ -146,6 +146,11 @@ class LdapConnection:
             if gpo.lockout_reset is not None:
                 lockout_reset = gpo.lockout_reset
 
+        if lockout_reset is None:
+            lockout_reset = 0
+        if lockout_threshold is None:
+            lockout_threshold = 0
+
         return lockout_threshold, lockout_reset
 
     def get_gpos_filepath(self, impacketfile, distinguished_names):

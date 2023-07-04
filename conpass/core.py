@@ -159,6 +159,7 @@ class ThreadPool:
             if self.all_users_found:
                 self.console.log(f'\n** All users passwords found! **')
                 break
+            time.sleep(0.1)
 
         # Block until all tasks are done
         self.testing_q.join()
