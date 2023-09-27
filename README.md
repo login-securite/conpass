@@ -9,7 +9,7 @@ Python tool for continuous password spraying taking into account the password po
 | Chapters                                | Description                                     |
 |-----------------------------------------|-------------------------------------------------|
 | [Warning](#warning)                     | Before using this tool, read this               |
-| [Installation](#installation)           | Lsassy installation                             |
+| [Installation](#installation)           | ConPass installation                             |
 | [Usage](#usage)                         | ConPass usage                                   |
 
 ## Warning
