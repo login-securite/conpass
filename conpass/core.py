@@ -111,6 +111,8 @@ class ThreadPool:
             self.users = self.ldapconnection.get_users(f)
 
             status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
+            status.console.log(f"{len([user for user in self.users if user.readable_pso() == -1])} users with PSO that [red]can not be read[/red]")
+            status.console.log(f"{len([user for user in self.users if user.readable_pso() == 1])} users with PSO that [green]can be read[/green]")
         self.threads = []
         self.max_threads = arguments.threads
         self.testing_q = Queue()
@@ -150,12 +152,15 @@ class ThreadPool:
             thread.start()
 
         while True:
-            with open(self.arguments.password_file) as f:
-                for password in f:
-                    if password.isspace():
-                        continue
-                    password = Password(password[:-1])
-                    self.all_users_found = self.add_users_password(password, self.progress)
+            try:
+                with open(self.arguments.password_file) as f:
+                    for password in f:
+                        if password.isspace():
+                            continue
+                        password = Password(password[:-1])
+                        self.all_users_found = self.add_users_password(password, self.progress)
+            except FileNotFoundError:
+                pass
             if self.all_users_found:
                 self.console.log(f'\n** All users passwords found! **')
                 break
