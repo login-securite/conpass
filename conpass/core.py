@@ -1,4 +1,3 @@
-import logging
 import os
 import queue
 import signal
@@ -87,8 +86,11 @@ class ThreadPool:
         self.console = Console()
         self.console.log("[yellow]This tool does its best to find the effective password policy but may be wrong. Use with caution.[/yellow]")
         self.progress = None
+        self.info = False
         self.debug = False
-        if self.arguments.verbose:
+        if self.arguments.v > 0:
+            self.info = True
+        if self.arguments.v > 1:
             self.debug = True
 
         # Resolve IP address from arguments.domain
@@ -122,12 +124,21 @@ class ThreadPool:
     # Add the users/password combination to the queue
     def add_users_password(self, password, progress):
         self.all_users_found = True
-        for user in self.users:
+        for key, user in enumerate(self.users):
+            # Check if user should be tested, depending on lockout policy and PSO
             user_status = user.should_test_password()
+
+            # Remove untestable users from list
+            if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
+                user_status == USER_STATUS.UNREADABLE_PSO and self.info and self.console.log(f"Discarding {user.samaccountname}: [red]PSO unreadable. Use -f to force testing[/red]")
+                del(self.users[key])
+                continue
             if user_status != USER_STATUS.FOUND:
                 self.all_users_found = False
-            if user_status in (USER_STATUS.TEST, USER_STATUS.THRESHOLD) and not [user, password] in self.tests:
-                logging.debug(f"Adding to queue {user.samaccountname} - {password.value}")
+            if user_status in (USER_STATUS.TEST, USER_STATUS.THRESHOLD, USER_STATUS.PSO) and not [user, password] in self.tests:
+                if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
+                    self.info and self.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
+                self.debug and self.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
                 self.testing_q.put([user, password])
                 self.tests.append([user, password])
                 progress.add_password()
@@ -139,7 +150,7 @@ class ThreadPool:
 
         # Check if file exists on disk
         if not os.path.isfile(self.arguments.password_file):
-            logging.info(f"File {self.arguments.password_file} does not exist Creating it...")
+            self.info and self.console.log(f"File {self.arguments.password_file} does not exist Creating it...")
             # Create file
             open(self.arguments.password_file, 'a').close()
 
@@ -151,12 +162,15 @@ class ThreadPool:
             self.threads.append(thread)
             thread.start()
 
+        # Always read the password file to discover new passwords
         while True:
             try:
                 with open(self.arguments.password_file) as f:
                     for password in f:
+                        # Ignore blank password
                         if password.isspace():
                             continue
+                        # Remove the trailing \n
                         password = Password(password[:-1])
                         self.all_users_found = self.add_users_password(password, self.progress)
             except FileNotFoundError:

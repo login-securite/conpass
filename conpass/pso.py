@@ -8,7 +8,7 @@ class PSO:
         self.readable = readable
 
     def __str__(self):
-        return f"{self.lockout_threshold} - {self.lockout_window} - {self.lockout_duration} - {self.precedence}" if self.readable else "Access Denied"
+        return f"Threshold: {self.lockout_threshold} - Window: {self.lockout_window} - Duration: {self.lockout_duration} - Precedence: {self.precedence}" if self.readable else "Access Denied"
 
     def __repr__(self):
         return self.__str__()

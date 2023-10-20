@@ -29,7 +29,7 @@ def main():
     group_auth.add_argument('--threads', default=10, type=int, action='store', help='Threads number (Default 10)')
 
     group_info = parser.add_argument_group('Info')
-    group_info.add_argument('-v', '--verbose', action='store_true', help='Get debug information')
+    group_info.add_argument('-v', action='count', default=0, help='Verbosity level (-v or -vv)')
     group_info.add_argument('-V', '--version', action='version', version='%(prog)s (version {})'.format(version))
 
     args = parser.parse_args()
