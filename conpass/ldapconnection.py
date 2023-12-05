@@ -114,18 +114,19 @@ class LdapConnection:
             ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName', 'msDS-PSOApplied']
             res = self.get_paged_objects(filters, ldap_attributes)
             lockout_threshold, lockout_reset = self.get_password_policy(impacketfile)
+            results = []
 
-            results = [
-                User(
-                    samaccountname=entry['sAMAccountName'][0].decode('utf-8'),
-                    dn=entry['distinguishedName'][0].decode('utf-8'),
-                    bad_password_count=0 if 'badPwdCount' not in entry else int(entry['badPwdCount'][0]),
-                    last_password_test=datetime.fromtimestamp(int((int(entry['badPasswordTime'][0].decode('utf-8')) / 10000000 - 11644473600))),
-                    lockout_threshold=lockout_threshold,
-                    lockout_reset=lockout_reset,
-                    pso=None if 'msDS-PSOApplied' not in entry else entry['msDS-PSOApplied']
-                ) for dn, entry in res if isinstance(entry, dict) and entry['sAMAccountName'][0].decode('utf-8')[-1] != '$'
-            ]
+            for dn, entry in res:
+                if isinstance(entry, dict) and entry['sAMAccountName'][0].decode('utf-8')[-1] != '$':
+                    results.append(User(
+                        samaccountname=entry['sAMAccountName'][0].decode('utf-8'),
+                        dn=entry['distinguishedName'][0].decode('utf-8'),
+                        bad_password_count=0 if 'badPwdCount' not in entry else int(entry['badPwdCount'][0]),
+                        last_password_test=datetime(1970, 1, 1, 0, 00) if 'badPasswordTime' not in entry else datetime.fromtimestamp(int((int(entry['badPasswordTime'][0].decode('utf-8')) / 10000000 - 11644473600))),
+                        lockout_threshold=lockout_threshold,
+                        lockout_reset=lockout_reset,
+                        pso=None if 'msDS-PSOApplied' not in entry else entry['msDS-PSOApplied']
+                    ))
             groups = self.get_groups_pso([user.dn for user in results])
             return self.apply_pso(results, groups)
 
@@ -150,6 +151,9 @@ class LdapConnection:
             return None
 
     def get_groups_pso(self, users):
+        """
+        1. Fetch all AD groups
+        """
         attributes = ['msDS-PSOApplied', 'member', 'distinguishedName', 'objectSid']
         filters = "(objectClass=Group)"
         all_groups = self.get_paged_objects(filters, attributes)
@@ -161,10 +165,16 @@ class LdapConnection:
             dict_groups[group[0]] = group[1:]
 
         groups = {}
+        """
+        2. Check for groups with PSO applied
+        """
         for group in all_groups:
             if 'msDS-PSOApplied' in group[1]:
                 groups[group[0]] = group[1]
 
+        """
+        3. Get all PSO applied group members
+        """
         for group in groups:
             groups[group]['user_members'] = self.find_members(groups[group], dict_groups, users)
         return groups
@@ -214,7 +224,11 @@ class LdapConnection:
                 attrlist=attributes
             )
 
-            rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
+            try:
+                rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
+            except ldap.NO_SUCH_OBJECT as e:
+                self.psos[pso] = PSO(dn=pso, readable=False)
+                continue
             dn, entry = rdata[0]
             if 'msDS-LockoutThreshold' not in entry:
                 self.psos[pso] = PSO(dn=pso, readable=False)
@@ -222,8 +236,8 @@ class LdapConnection:
                 self.psos[pso] = PSO(
                     pso,
                     int(entry['msDS-LockoutThreshold'][0].decode('utf-8')),
-                    entry['msDS-LockoutObservationWindow'][0].decode('utf-8'),
-                    entry['msDS-LockoutDuration'][0].decode('utf-8'),
+                    int(entry['msDS-LockoutObservationWindow'][0].decode('utf-8')),
+                    int(entry['msDS-LockoutDuration'][0].decode('utf-8')),
                     int(entry['msDS-PasswordSettingsPrecedence'][0].decode('utf-8'))
                 )
                 parsed_psos[self.psos[pso].precedence] = self.psos[pso]
@@ -280,6 +294,7 @@ class LdapConnection:
         ret = {}
         for dn, entry in rdata:
             if isinstance(entry, dict) and 'gPCFileSysPath' in entry and dn.lower() in distinguished_names:
+                self.debug and self.console.log(f"Trying to fetch {entry['gPCFileSysPath'][0].decode('utf-8')}")
                 ret[dn.lower()] = GPO.get_password_policy(impacketfile, entry['gPCFileSysPath'][0].decode('utf-8'))
         return ret
 

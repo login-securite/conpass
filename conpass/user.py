@@ -24,6 +24,7 @@ class User:
         self.first_attempt = True
 
     def should_test_password(self):
+
         # Checking all PSO applied to user. If one PSO is not readable (access denied), the user should not be tested
         # as the PSO might be more strict than the global password policy
 
