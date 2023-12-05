@@ -42,9 +42,10 @@ class QueueProgress:
 
 
 class Worker(threading.Thread):
-    def __init__(self, testing_q, ldapconnection, smbconnection, queue_progress):
+    def __init__(self, testing_q, test_user_lock, ldapconnection, smbconnection, queue_progress):
         super().__init__()
         self.testing_q = testing_q
+        self.test_user_lock = test_user_lock
         self.ldapconnection = ldapconnection
         self.smbconnection = smbconnection
         self.console = self.ldapconnection.console
@@ -57,22 +58,25 @@ class Worker(threading.Thread):
             exit(1)
         while True:
             try:
-                user, password = self.testing_q.get(timeout=0.1)
-                user_status = user.should_test_password()
-                if user_status == USER_STATUS.THRESHOLD:
-                    self.testing_q.put([user, password])
-                    self.testing_q.task_done()
-                    continue
-                elif user_status == USER_STATUS.FOUND:
-                    self.testing_q.task_done()
-                    self.queue_progress.task_done()
-                    continue
+                with lock:
+                    user, password = self.testing_q.get(timeout=0.1)
+                    user_status = user.should_test_password()
+                    if user.samaccountname in self.test_user_lock or user_status == USER_STATUS.THRESHOLD or user_status == USER_STATUS.FOUND:
+                        self.testing_q.put([user, password])
+                        self.testing_q.task_done()
+                        continue
+
+                    # Add the user to the lock list so it can not be tested by another thread
+                    self.test_user_lock.append(user.samaccountname)
                 # Can use ldapconnection istead, but no hash authentication implemented
                 user_found = user.test_password(password, conn=self.smbconnection)
                 if user_found:
                     self.console.log(f"[green]Found: {user.samaccountname} - {password.value}[/green]")
                 self.testing_q.task_done()
                 self.queue_progress.task_done()
+                with lock:
+                    self.test_user_lock.remove(user.samaccountname)
+
             except queue.Empty as e:
                 time.sleep(0.1)
                 continue
@@ -119,6 +123,7 @@ class ThreadPool:
         self.threads = []
         self.max_threads = arguments.threads
         self.testing_q = Queue()
+        self.test_user_lock = []
         self.tests = []
         self.all_users_found = False
 
@@ -158,7 +163,7 @@ class ThreadPool:
         self.progress = QueueProgress()
 
         for i in range(self.max_threads):
-            thread = Worker(self.testing_q, LdapConnection(host=self.dc_ip, domain=self.arguments.domain, username=self.arguments.username, password=self.arguments.password, console=self.progress.progress.console, debug=self.debug), smbconnection=Session(address=self.dc_ip, target_ip=self.dc_ip, domain=self.arguments.domain, port=445, console=self.progress.progress.console, debug=self.debug), queue_progress=self.progress)
+            thread = Worker(self.testing_q, self.test_user_lock, LdapConnection(host=self.dc_ip, domain=self.arguments.domain, username=self.arguments.username, password=self.arguments.password, console=self.progress.progress.console, debug=self.debug), smbconnection=Session(address=self.dc_ip, target_ip=self.dc_ip, domain=self.arguments.domain, port=445, console=self.progress.progress.console, debug=self.debug), queue_progress=self.progress)
             thread.daemon = True
             self.threads.append(thread)
             thread.start()
