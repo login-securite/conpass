@@ -23,8 +23,8 @@ class GPO:
         content = file.read(file.size()).decode("utf-16-le")
         file.close()
 
-        lockout_threshold = None if "LockoutBadCount" not in content else int(re.compile(r"LockoutBadCount *= *(\d+)").findall(content)[0])
-        lockout_reset = None if "ResetLockoutCount" not in content else int(re.compile(r"ResetLockoutCount *= *(\d+)").findall(content)[0])
+        lockout_threshold = None if "LockoutBadCount" not in content else int(re.compile(r"LockoutBadCount *= *(\d+)", flags=re.IGNORECASE).findall(content)[0])
+        lockout_reset = None if "ResetLockoutCount" not in content else int(re.compile(r"ResetLockoutCount *= *(\d+)", flags=re.IGNORECASE).findall(content)[0])
 
         if lockout_reset is None:
             lockout_reset = 0

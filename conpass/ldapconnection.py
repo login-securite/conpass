@@ -256,14 +256,13 @@ class LdapConnection:
         _, rdata, _, _ = self._conn.result3(res)
         dn, entry = rdata[0]
 
-        gpo_distinguished_names = [dn.lower() for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]').findall(entry['gPLink'][0].decode('utf-8'))]
-
+        gpo_distinguished_names = [dn.lower() for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8'))]
         gpos = self.get_gpos_filepath(impacketfile, gpo_distinguished_names)
         self.console.log(f"{len(gpo_distinguished_names)} GPOs linked to root domain - {len([gpo for gpo in gpos if gpos[gpo] != (None, None)])} have a password policy")
 
         if 'gPLink' not in entry:
             return []
-        res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]').findall(entry['gPLink'][0].decode('utf-8'))]
+        res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8'))]
 
         lockout_threshold, lockout_reset = None, None
         for gpo in res:

@@ -28,12 +28,13 @@ class User:
         # Checking all PSO applied to user. If one PSO is not readable (access denied), the user should not be tested
         # as the PSO might be more strict than the global password policy
 
+
         if self.readable_pso() == -1:
             return USER_STATUS.UNREADABLE_PSO
 
         # PSOs are ordered by ascending priority (descending precedence)
         for pso in self.pso.values():
-            self.lockout_threshold, self.lockout_reset = pso.lockout_threshold, pso.lockout_window
+            self.lockout_threshold, self.lockout_reset = pso.lockout_threshold, -(pso.lockout_window/10000000/60)
 
         # Skip users if password already found
         if self.password is not None:
@@ -63,12 +64,6 @@ class User:
             return False
         self.password = password
         return True
-
-    def resultant_pso(self):
-        if self.readable_pso() != 1:
-            return None
-        for pso in self.pso.values():
-            self.lockout_threshold, self.lockout_reset = pso.lockout_threshold, pso.lockout_window
 
     def __eq__(self, other):
         return isinstance(other, self.__class__) and self.samaccountname == other.samaccountname
