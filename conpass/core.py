@@ -117,6 +117,7 @@ class ThreadPool:
             f = ImpacketFile(session, status.console, debug=self.debug)
             self.users = self.ldapconnection.get_users(f, disabled=False)
 
+            status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
             status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == -1])} users with PSO that [red]can not be read[/red]")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == 1])} users with PSO that [green]can be read[/green]")

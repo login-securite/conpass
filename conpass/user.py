@@ -32,9 +32,9 @@ class User:
         if self.readable_pso() == -1:
             return USER_STATUS.UNREADABLE_PSO
 
-        # PSOs are ordered by ascending priority (descending precedence)
-        for pso in self.pso.values():
-            self.lockout_threshold, self.lockout_reset = pso.lockout_threshold, -(pso.lockout_window/10000000/60)
+
+        if self.pso is not None:
+            self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
 
         # Skip users if password already found
         if self.password is not None:
@@ -52,10 +52,10 @@ class User:
         return USER_STATUS.TEST
 
     def readable_pso(self):
-        for pso in self.pso.values():
-            if not pso.readable:
-                return -1
-        return 1 if self.pso != {} else 0
+        if self.pso is None:
+            return 0
+        return 1 if self.pso.readable else -1
+        
 
     def test_password(self, password, conn):
         self.last_password_test = datetime.now()

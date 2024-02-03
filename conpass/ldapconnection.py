@@ -111,7 +111,7 @@ class LdapConnection:
         else:
             filters = filters[0]
         try:
-            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName', 'msDS-PSOApplied']
+            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName', 'msDS-ResultantPSO']
             res = self.get_paged_objects(filters, ldap_attributes)
             lockout_threshold, lockout_reset = self.get_password_policy(impacketfile)
             results = []
@@ -125,10 +125,9 @@ class LdapConnection:
                         last_password_test=datetime(1970, 1, 1, 0, 00) if 'badPasswordTime' not in entry else datetime.fromtimestamp(int((int(entry['badPasswordTime'][0].decode('utf-8')) / 10000000 - 11644473600))),
                         lockout_threshold=lockout_threshold,
                         lockout_reset=lockout_reset,
-                        pso=None if 'msDS-PSOApplied' not in entry else entry['msDS-PSOApplied']
+                        pso=None if 'msDS-ResultantPSO' not in entry else self.get_policy_from_pso(entry['msDS-ResultantPSO'][0])
                     ))
-            groups = self.get_groups_pso([user.dn for user in results])
-            return self.apply_pso(results, groups)
+            return results
 
         except Exception as e:
             print(e)
@@ -137,111 +136,36 @@ class LdapConnection:
                 self.console.print_exception()
             return False
 
-    def get_user_pso(self, user_dn):
-        attributes = ['msDS-PSOApplied']
+    def get_policy_from_pso(self, pso):
+        if pso in self.psos:
+            return self.psos[pso]
+
+        attributes = ['msDS-LockoutThreshold', 'msDS-PasswordSettingsPrecedence', 'msDS-LockoutObservationWindow', 'msDS-LockoutDuration']
+        pso = pso.decode('utf-8')
+        
         res = self._conn.search_ext(
-            user_dn,
+            pso,
             ldap.SCOPE_SUBTREE,
             attrlist=attributes
         )
 
-        rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
+        try:
+            rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
+        except ldap.NO_SUCH_OBJECT as e:
+            self.psos[pso] = PSO(dn=pso, readable=False)
+            return self.psos[pso]
         dn, entry = rdata[0]
-        if 'msDS-PSOApplied' not in entry:
-            return None
-
-    def get_groups_pso(self, users):
-        """
-        1. Fetch all AD groups
-        """
-        attributes = ['msDS-PSOApplied', 'member', 'distinguishedName', 'objectSid']
-        filters = "(objectClass=Group)"
-        all_groups = self.get_paged_objects(filters, attributes)
-        dict_groups = {}
-        for group in all_groups:
-            if 'objectSid' not in group[1]:
-                continue
-            group[1]['objectSid'][0] = convert(group[1]['objectSid'][0])
-            dict_groups[group[0]] = group[1:]
-
-        groups = {}
-        """
-        2. Check for groups with PSO applied
-        """
-        for group in all_groups:
-            if 'msDS-PSOApplied' in group[1]:
-                groups[group[0]] = group[1]
-
-        """
-        3. Get all PSO applied group members
-        """
-        for group in groups:
-            groups[group]['user_members'] = self.find_members(groups[group], dict_groups, users)
-        return groups
-
-    def update_user(self, users, dn, applied_psos):
-        for user in users:
-            if user.dn == dn:
-                if user.pso is None:
-                    user.pso = applied_psos
-                else:
-                    user.pso = user.pso + applied_psos
-
-    def apply_pso(self, users, groups):
-        for group in groups:
-            for user in groups[group]['user_members']:
-                self.update_user(users, user, groups[group]['msDS-PSOApplied'])
-
-        for user in users:
-            user.pso = self.get_policy_from_psos(user.pso)
-        return users
-
-    def find_members(self, group, groups, users):
-        members = []
-        if group['objectSid'][0][-4:] == '-513':
-            # Domain Users
-            return users
-        for member in group.get('member', []):
-            if member.decode('utf-8') not in groups:
-                members.append(member.decode('utf-8'))
-            else:
-                members = members + self.find_members(groups[member.decode('utf-8')][0], groups, users)
-        return members
-
-    def get_policy_from_psos(self, psos):
-        parsed_psos = {}
-        if psos is None:
-            return parsed_psos
-        attributes = ['msDS-LockoutThreshold', 'msDS-PasswordSettingsPrecedence', 'msDS-LockoutObservationWindow', 'msDS-LockoutDuration']
-        for pso in psos:
-            pso = pso.decode('utf-8')
-            if pso in self.psos:
-                parsed_psos[self.psos[pso].precedence] = self.psos[pso]
-                continue
-            res = self._conn.search_ext(
+        if 'msDS-LockoutThreshold' not in entry:
+            self.psos[pso] = PSO(dn=pso, readable=False)
+        else:
+            self.psos[pso] = PSO(
                 pso,
-                ldap.SCOPE_SUBTREE,
-                attrlist=attributes
+                int(entry['msDS-LockoutThreshold'][0].decode('utf-8')),
+                int(entry['msDS-LockoutObservationWindow'][0].decode('utf-8')),
+                int(entry['msDS-LockoutDuration'][0].decode('utf-8')),
+                int(entry['msDS-PasswordSettingsPrecedence'][0].decode('utf-8'))
             )
-
-            try:
-                rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
-            except ldap.NO_SUCH_OBJECT as e:
-                self.psos[pso] = PSO(dn=pso, readable=False)
-                continue
-            dn, entry = rdata[0]
-            if 'msDS-LockoutThreshold' not in entry:
-                self.psos[pso] = PSO(dn=pso, readable=False)
-            else:
-                self.psos[pso] = PSO(
-                    pso,
-                    int(entry['msDS-LockoutThreshold'][0].decode('utf-8')),
-                    int(entry['msDS-LockoutObservationWindow'][0].decode('utf-8')),
-                    int(entry['msDS-LockoutDuration'][0].decode('utf-8')),
-                    int(entry['msDS-PasswordSettingsPrecedence'][0].decode('utf-8'))
-                )
-                parsed_psos[self.psos[pso].precedence] = self.psos[pso]
-        return parsed_psos
+        return self.psos[pso]
 
     def get_password_policy(self, impacketfile):
         filters = "(&(distinguishedName={}))".format(self.domain_dn)
