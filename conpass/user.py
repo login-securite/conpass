@@ -23,15 +23,13 @@ class User:
         self.pso = pso
         self.first_attempt = True
 
-    def should_test_password(self):
+    def should_test_password(self, security_threshold=1):
 
         # Checking all PSO applied to user. If one PSO is not readable (access denied), the user should not be tested
         # as the PSO might be more strict than the global password policy
 
-
         if self.readable_pso() == -1:
             return USER_STATUS.UNREADABLE_PSO
-
 
         if self.pso is not None:
             self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
@@ -40,8 +38,8 @@ class User:
         if self.password is not None:
             return USER_STATUS.FOUND
 
-        # Skip users with bad password count close to lockout threshold
-        if self.lockout_threshold > 0 and self.bad_password_count >= self.lockout_threshold-1 and (self.first_attempt or self.last_password_test + timedelta(minutes=self.lockout_reset) > datetime.now()):
+        # Skip users with bad password count close to lockout threshold and still in of observation window
+        if self.lockout_threshold > 0 and self.bad_password_count >= (self.lockout_threshold-security_threshold) and (self.first_attempt or self.last_password_test + timedelta(minutes=self.lockout_reset) > datetime.now()):
             self.first_attempt = False
             return USER_STATUS.THRESHOLD
 
@@ -55,7 +53,6 @@ class User:
         if self.pso is None:
             return 0
         return 1 if self.pso.readable else -1
-        
 
     def test_password(self, password, conn):
         self.last_password_test = datetime.now()

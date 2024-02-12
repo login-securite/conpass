@@ -42,7 +42,7 @@ class QueueProgress:
 
 
 class Worker(threading.Thread):
-    def __init__(self, testing_q, test_user_lock, ldapconnection, smbconnection, queue_progress):
+    def __init__(self, testing_q, test_user_lock, ldapconnection, smbconnection, queue_progress, security_threshold=1):
         super().__init__()
         self.testing_q = testing_q
         self.test_user_lock = test_user_lock
@@ -50,6 +50,7 @@ class Worker(threading.Thread):
         self.smbconnection = smbconnection
         self.console = self.ldapconnection.console
         self.queue_progress = queue_progress
+        self.security_threshold = security_threshold
 
     def run(self):
         if not self.ldapconnection.login():
@@ -60,7 +61,7 @@ class Worker(threading.Thread):
             try:
                 with lock:
                     user, password = self.testing_q.get(timeout=0.1)
-                    user_status = user.should_test_password()
+                    user_status = user.should_test_password(self.security_threshold)
                     if user.samaccountname in self.test_user_lock or user_status == USER_STATUS.THRESHOLD or user_status == USER_STATUS.FOUND:
                         self.testing_q.put([user, password])
                         self.testing_q.task_done()
@@ -118,7 +119,7 @@ class ThreadPool:
             self.users = self.ldapconnection.get_users(f, disabled=False)
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
-            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
+            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts (Will stop at ' + str(self.users[0].lockout_threshold - self.arguments.security_threshold) + ')' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == -1])} users with PSO that [red]can not be read[/red]")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == 1])} users with PSO that [green]can be read[/green]")
         self.threads = []
@@ -133,7 +134,7 @@ class ThreadPool:
         self.all_users_found = True
         for key, user in enumerate(self.users):
             # Check if user should be tested, depending on lockout policy and PSO
-            user_status = user.should_test_password()
+            user_status = user.should_test_password(self.arguments.security_threshold)
 
             # Remove untestable users from list
             if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
@@ -164,7 +165,7 @@ class ThreadPool:
         self.progress = QueueProgress()
 
         for i in range(self.max_threads):
-            thread = Worker(self.testing_q, self.test_user_lock, LdapConnection(host=self.dc_ip, domain=self.arguments.domain, username=self.arguments.username, password=self.arguments.password, console=self.progress.progress.console, debug=self.debug), smbconnection=Session(address=self.dc_ip, target_ip=self.dc_ip, domain=self.arguments.domain, port=445, console=self.progress.progress.console, debug=self.debug), queue_progress=self.progress)
+            thread = Worker(self.testing_q, self.test_user_lock, LdapConnection(host=self.dc_ip, domain=self.arguments.domain, username=self.arguments.username, password=self.arguments.password, console=self.progress.progress.console, debug=self.debug), smbconnection=Session(address=self.dc_ip, target_ip=self.dc_ip, domain=self.arguments.domain, port=445, console=self.progress.progress.console, debug=self.debug), queue_progress=self.progress, security_threshold=self.arguments.security_threshold)
             thread.daemon = True
             self.threads.append(thread)
             thread.start()

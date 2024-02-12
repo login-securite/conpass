@@ -62,7 +62,9 @@ class Session:
         try:
             self.smb_session.login(username, password_value, self.domain, "", nthash)
             return True
-        except SessionError:
+        except SessionError as e:
+            if 'STATUS_LOGON_FAILURE' not in str(e):
+                print(f"WARNING ERROR FOR {username}: {e}")
             return False
         except Exception as e:
             self.get_session()

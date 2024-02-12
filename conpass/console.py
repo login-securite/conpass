@@ -24,8 +24,8 @@ def main():
                             help='IP Address of the primary domain controller.')
 
     group_spray = parser.add_argument_group('Spray')
-    group_spray.add_argument('-P', '--password-file', action='store', help='File containing passwords to test',
-                            required=True)
+    group_spray.add_argument('-P', '--password-file', action='store', help='File containing passwords to test', required=True)
+    group_spray.add_argument('-S', '--security-threshold', default=1, type=int, action='store', help='Specifies the number of remaining attempts allowed before reaching the lockout threshold (Default: 1)')
     group_auth.add_argument('--threads', default=10, type=int, action='store', help='Threads number (Default 10)')
 
     group_info = parser.add_argument_group('Info')

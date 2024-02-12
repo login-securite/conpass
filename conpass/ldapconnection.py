@@ -183,11 +183,14 @@ class LdapConnection:
         gpo_distinguished_names = [dn.lower() for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8'))]
         gpos = self.get_gpos_filepath(impacketfile, gpo_distinguished_names)
         self.console.log(f"{len(gpo_distinguished_names)} GPOs linked to root domain - {len([gpo for gpo in gpos if gpos[gpo] != (None, None)])} have a password policy")
+        if self.debug:
+            for gpo in gpos:
+                if gpos[gpo] != (None, None):
+                    self.console.log(f"{gpo} policy: Threshold {gpos[gpo][0]} | Reset {gpos[gpo][1]}")
 
         if 'gPLink' not in entry:
             return []
         res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8'))]
-
         lockout_threshold, lockout_reset = None, None
         for gpo in res:
             if gpo.options & GPO.GPLINK_OPT_DISABLE:
@@ -201,7 +204,6 @@ class LdapConnection:
             lockout_reset = 0
         if lockout_threshold is None:
             lockout_threshold = 0
-
         return lockout_threshold, lockout_reset
 
     def get_gpos_filepath(self, impacketfile, distinguished_names):
