@@ -5,12 +5,13 @@
 
 import ldap
 from ldap.controls import SimplePagedResultsControl
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 
 from conpass.pso import PSO
 from conpass.user import User
 from conpass.gpo import GPO
+from conpass import utils
 import struct
 
 def convert(binary):
@@ -94,7 +95,7 @@ class LdapConnection:
                 self.console.print_exception()
             return False
 
-    def get_users(self, impacketfile, users=None, disabled=True):
+    def get_users(self, impacketfile, time_delta, users=None, disabled=True):
         filters = ["(objectClass=User)"]
         if users:
             if len(users) == 1:
@@ -122,10 +123,11 @@ class LdapConnection:
                         samaccountname=entry['sAMAccountName'][0].decode('utf-8'),
                         dn=entry['distinguishedName'][0].decode('utf-8'),
                         bad_password_count=0 if 'badPwdCount' not in entry else int(entry['badPwdCount'][0]),
-                        last_password_test=datetime(1970, 1, 1, 0, 00) if 'badPasswordTime' not in entry else datetime.fromtimestamp(int((int(entry['badPasswordTime'][0].decode('utf-8')) / 10000000 - 11644473600))),
+                        last_password_test=datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc) if 'badPasswordTime' not in entry else utils.win_timestamp_to_datetime(int(entry['badPasswordTime'][0].decode('utf-8'))),
                         lockout_threshold=lockout_threshold,
                         lockout_reset=lockout_reset,
-                        pso=None if 'msDS-ResultantPSO' not in entry else self.get_policy_from_pso(entry['msDS-ResultantPSO'][0])
+                        pso=None if 'msDS-ResultantPSO' not in entry else self.get_policy_from_pso(entry['msDS-ResultantPSO'][0]),
+                        time_delta=time_delta
                     ))
             return results
 

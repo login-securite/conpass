@@ -1,3 +1,4 @@
+import datetime
 import os
 import queue
 import signal
@@ -61,8 +62,7 @@ class Worker(threading.Thread):
             try:
                 with lock:
                     user, password = self.testing_q.get(timeout=0.1)
-                    user_status = user.should_test_password(self.security_threshold)
-                    if user.samaccountname in self.test_user_lock or user_status == USER_STATUS.THRESHOLD or user_status == USER_STATUS.FOUND:
+                    if user.samaccountname in self.test_user_lock or user.should_test_password(self.security_threshold) in (USER_STATUS.THRESHOLD, USER_STATUS.FOUND):
                         self.testing_q.put([user, password])
                         self.testing_q.task_done()
                         continue
@@ -113,10 +113,16 @@ class ThreadPool:
             if not self.ldapconnection.login():
                 exit(1)
             session = Session(address=self.dc_ip, target_ip=self.dc_ip, domain=arguments.domain, port=445, console=status.console, debug=self.debug).get_session()
+            utc_remote_time = session.get_remote_time()
+            utc_local_time = datetime.datetime.now(datetime.timezone.utc)
+            time_delta = utc_local_time - utc_remote_time
+            self.debug and status.console.log(f"UTC REMOTE: {utc_remote_time}")
+            self.debug and status.console.log(f"UTC LOCAL: {utc_local_time}")
+            self.debug and status.console.log(f"UTC DIFF: {time_delta.total_seconds()} seconds")
             if not session.login(arguments.username, arguments.password):
                 exit(1)
             f = ImpacketFile(session, status.console, debug=self.debug)
-            self.users = self.ldapconnection.get_users(f, disabled=False)
+            self.users = self.ldapconnection.get_users(f, time_delta, disabled=False)
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
             status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts (Will stop at ' + str(self.users[0].lockout_threshold - self.arguments.security_threshold) + ')' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
@@ -134,7 +140,7 @@ class ThreadPool:
         self.all_users_found = True
         for key, user in enumerate(self.users):
             # Check if user should be tested, depending on lockout policy and PSO
-            user_status = user.should_test_password(self.arguments.security_threshold)
+            user_status = user.should_be_discarded()
 
             # Remove untestable users from list
             if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
@@ -143,7 +149,7 @@ class ThreadPool:
                 continue
             if user_status != USER_STATUS.FOUND:
                 self.all_users_found = False
-            if user_status in (USER_STATUS.TEST, USER_STATUS.THRESHOLD, USER_STATUS.PSO) and not [user, password] in self.tests:
+            if user_status in (USER_STATUS.TEST, USER_STATUS.PSO) and not [user, password] in self.tests:
                 if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
                     self.info and self.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
                 self.debug and self.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
@@ -165,7 +171,25 @@ class ThreadPool:
         self.progress = QueueProgress()
 
         for i in range(self.max_threads):
-            thread = Worker(self.testing_q, self.test_user_lock, LdapConnection(host=self.dc_ip, domain=self.arguments.domain, username=self.arguments.username, password=self.arguments.password, console=self.progress.progress.console, debug=self.debug), smbconnection=Session(address=self.dc_ip, target_ip=self.dc_ip, domain=self.arguments.domain, port=445, console=self.progress.progress.console, debug=self.debug), queue_progress=self.progress, security_threshold=self.arguments.security_threshold)
+            thread = Worker(
+                self.testing_q,
+                self.test_user_lock,
+                LdapConnection(
+                    host=self.dc_ip,
+                    domain=self.arguments.domain,
+                    username=self.arguments.username,
+                    password=self.arguments.password,
+                    console=self.progress.progress.console,
+                    debug=self.debug
+                ), smbconnection=Session(
+                    address=self.dc_ip,
+                    target_ip=self.dc_ip,
+                    domain=self.arguments.domain,
+                    port=445,
+                    console=self.progress.progress.console,
+                    debug=self.debug),
+                queue_progress=self.progress,
+                security_threshold=self.arguments.security_threshold)
             thread.daemon = True
             self.threads.append(thread)
             thread.start()
