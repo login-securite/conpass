@@ -127,7 +127,9 @@ class LdapConnection:
                         lockout_threshold=lockout_threshold,
                         lockout_reset=lockout_reset,
                         pso=None if 'msDS-ResultantPSO' not in entry else self.get_policy_from_pso(entry['msDS-ResultantPSO'][0]),
-                        time_delta=time_delta
+                        time_delta=time_delta,
+                        console=self.console,
+                        debug=self.debug
                     ))
             return results
 

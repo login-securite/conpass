@@ -12,7 +12,7 @@ class USER_STATUS(Enum):
 
 
 class User:
-    def __init__(self, samaccountname, dn, last_password_test, bad_password_count, lockout_reset, lockout_threshold, pso, time_delta):
+    def __init__(self, samaccountname, dn, last_password_test, bad_password_count, lockout_reset, lockout_threshold, pso, time_delta, console, debug):
         self.samaccountname = samaccountname
         self.dn = dn
         self.password = None
@@ -23,15 +23,16 @@ class User:
         self.pso = pso
         self.first_attempt = True
         self.time_delta = time_delta
+        self.console = console
+        self.debug = debug
 
         if self.pso is not None:
             self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
 
-        """
-        print(f"{self.samaccountname}\tLast pwd test : {self.last_password_test} - Lockout threshold {self.lockout_threshold} - Reset {self.lockout_reset} min")
-        print(f"\tWhen it can be changed: {self.last_password_test + timedelta(minutes=self.lockout_reset)}")
-        print(f"\tServer time:            {datetime.now(timezone.utc) - self.time_delta}")
-        """
+        self.debug and self.console.log(f"{self.samaccountname}\tLast pwd test : {self.last_password_test} - Lockout threshold {self.bad_password_count}/{self.lockout_threshold} - Reset {self.lockout_reset} min")
+        self.debug and self.console.log(f"\tWhen it can be changed: {self.last_password_test + timedelta(minutes=self.lockout_reset)}")
+        self.debug and self.console.log(f"\tServer time:            {datetime.now(timezone.utc) - self.time_delta}")
+
 
     def should_test_password(self, security_threshold=1):
         # Checking all PSO applied to user. If one PSO is not readable (access denied), the user should not be tested
@@ -56,11 +57,11 @@ class User:
             return USER_STATUS.THRESHOLD
 
         if self.lockout_threshold < 0 or self.bad_password_count < (self.lockout_threshold - security_threshold):
-            print(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
+            self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
         else:
-            print(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
-            print(f"{self.last_password_test + timedelta(minutes=self.lockout_reset)} is less than...")
-            print(f"{datetime.now(timezone.utc) - self.time_delta} ?")
+            self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
+            self.debug and self.console.log(f"{self.last_password_test + timedelta(minutes=self.lockout_reset)} is less than...")
+            self.debug and self.console.log(f"{datetime.now(timezone.utc) - self.time_delta} ?")
 
         self.first_attempt = False
 

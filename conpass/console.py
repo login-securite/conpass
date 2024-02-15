@@ -34,6 +34,7 @@ def main():
 
     ThreadPool(args).run()
 
-
+# TODO
+# Vérifier sur LDAP que le badpwdcount est synchro. Faut le remettre à 0 par exemple après un observation windows. Est-ce qu'on peut pas aller recup le compte LDAP à ce moment là ? Pas si souvent ...
 if __name__ == "__main__":
     main()
