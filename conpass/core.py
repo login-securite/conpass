@@ -135,29 +135,6 @@ class ThreadPool:
         self.tests = []
         self.all_users_found = False
 
-    # Add the users/password combination to the queue
-    def add_users_password(self, password, progress):
-        self.all_users_found = True
-        for key, user in enumerate(self.users):
-            # Check if user should be tested, depending on lockout policy and PSO
-            user_status = user.should_be_discarded()
-
-            # Remove untestable users from list
-            if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
-                user_status == USER_STATUS.UNREADABLE_PSO and self.info and self.console.log(f"Discarding {user.samaccountname}: [red]PSO unreadable. Use -f to force testing[/red]")
-                del(self.users[key])
-                continue
-            if user_status != USER_STATUS.FOUND:
-                self.all_users_found = False
-            if user_status in (USER_STATUS.TEST, USER_STATUS.PSO) and not [user, password] in self.tests:
-                if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
-                    self.info and self.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
-                self.debug and self.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
-                self.testing_q.put([user, password])
-                self.tests.append([user, password])
-                progress.add_password()
-        return self.all_users_found
-
     # Start the threads
     def run(self):
         threading.current_thread().name = "[Core]"
@@ -214,6 +191,31 @@ class ThreadPool:
 
         # Block until all tasks are done
         self.testing_q.join()
+
+    # Add the users/password combination to the queue
+    def add_users_password(self, password, progress):
+        self.all_users_found = True
+        for key, user in enumerate(self.users):
+            # Check if user should be tested, depending on lockout policy and PSO
+            user_status = user.should_be_discarded()
+
+            # Remove untestable users from list
+            if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
+                user_status == USER_STATUS.UNREADABLE_PSO and self.info and self.console.log(f"Discarding {user.samaccountname}: [red]PSO unreadable. Use -f to force testing[/red]")
+                del(self.users[key])
+                continue
+            if user_status != USER_STATUS.FOUND:
+                self.all_users_found = False
+            if user_status in (USER_STATUS.TEST, USER_STATUS.PSO) and not [user, password] in self.tests:
+                if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
+                    self.info and self.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
+                self.debug and self.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
+                self.testing_q.put([user, password])
+                self.tests.append([user, password])
+                progress.add_password()
+        return self.all_users_found
+
+
 
     # Handle the interrupt signal
     def interrupt_event(self, signum, stack):

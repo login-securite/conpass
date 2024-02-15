@@ -5,8 +5,6 @@ from conpass.core import ThreadPool
 
 
 def main():
-    # user = User(samaccountname='Administrator', last_password_test=None, lockout_threshold=0, bad_password_count=0)
-
     """
     Command line function to call conpass
     """
