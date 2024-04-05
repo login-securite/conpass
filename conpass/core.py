@@ -123,7 +123,7 @@ class ThreadPool:
                 exit(1)
             f = ImpacketFile(session, status.console, debug=self.debug)
             # Remove users with only 1 try, or <=N tries if `-S N` provided
-            self.users = [user for user in self.ldapconnection.get_users(f, time_delta, disabled=False) if user.lockout_threshold > self.arguments.security_threshold]
+            self.users = [user for user in self.ldapconnection.get_users(f, time_delta, disabled=False) if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
             status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts (Will stop at ' + str(self.users[0].lockout_threshold - self.arguments.security_threshold) + ')' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
