@@ -60,9 +60,13 @@ class Worker(threading.Thread):
             exit(1)
         while True:
             try:
-                with lock:
+                with lock:                    
                     user, password = self.testing_q.get(timeout=0.1)
-                    if user.samaccountname in self.test_user_lock or user.should_test_password(self.security_threshold) in (USER_STATUS.THRESHOLD, USER_STATUS.FOUND):
+                    if user.should_test_password(self.security_threshold) == USER_STATUS.FOUND:
+                        self.testing_q.task_done()
+                        self.queue_progress.task_done()
+                        continue
+                    if user.samaccountname in self.test_user_lock or user.should_test_password(self.security_threshold) == USER_STATUS.THRESHOLD:
                         self.testing_q.put([user, password])
                         self.testing_q.task_done()
                         continue
@@ -123,6 +127,10 @@ class ThreadPool:
                 exit(1)
             f = ImpacketFile(session, status.console, debug=self.debug)
             # Remove users with only 1 try, or <=N tries if `-S N` provided
+            users = self.ldapconnection.get_users(f, time_delta, disabled=False)
+            if not users:
+                status.console.log(f"Couldn't retreive users")
+                exit()
             self.users = [user for user in self.ldapconnection.get_users(f, time_delta, disabled=False) if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")

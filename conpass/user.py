@@ -26,7 +26,7 @@ class User:
         self.console = console
         self.debug = debug
 
-        if self.pso is not None:
+        if self.pso is not None and self.pso.readable:
             self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
 
         self.debug and self.console.log(f"{self.samaccountname}\tLast pwd test : {self.last_password_test} - Lockout threshold {self.bad_password_count}/{self.lockout_threshold} - Reset {self.lockout_reset} min")
