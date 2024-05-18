@@ -70,15 +70,19 @@ class User:
         return USER_STATUS.TEST
 
     def should_be_discarded(self):
-        if self.readable_pso() == -1:
-            return USER_STATUS.UNREADABLE_PSO
-
+        # Password already found
         if self.password is not None:
             return USER_STATUS.FOUND
 
+        # Cannot read PSO, so should be discarded
+        if self.readable_pso() == -1:
+            return USER_STATUS.UNREADABLE_PSO
+
+        # Has PSO, but can be read, should be tested
         if self.readable_pso() == 1:
             return USER_STATUS.PSO
 
+        # Default domain policy, should be tested
         return USER_STATUS.TEST
 
     def readable_pso(self):
@@ -86,7 +90,7 @@ class User:
             return 0
         return 1 if self.pso.readable else -1
 
-    def test_password(self, password, conn):
+    def test_password(self, password, conn, thread_name=""):
         self.last_password_test = datetime.now(timezone.utc) - self.time_delta
         if not conn.test_credentials(self.samaccountname, password):
             self.bad_password_count += 1

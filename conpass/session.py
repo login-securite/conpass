@@ -66,6 +66,11 @@ class Session:
             self.smb_session.login(username, password_value, self.domain, "", nthash)
             return True
         except Exception as e:
+            if 'Broken pipe' in str(e):
+                import time
+                time.sleep(0.5)
+                self.get_session()
+                self.test_credentials(username, password)
             if 'STATUS_ACCOUNT_LOCKED_OUT' in str(e):
                 self.locked_out.append(username)
                 self.console.log(f"[yellow]DANGER: {username} LOCKED OUT (Unlock-ADAccount -Identity {username})")

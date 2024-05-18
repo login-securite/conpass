@@ -59,32 +59,33 @@ class Worker(threading.Thread):
         if not self.smbconnection.get_session():
             exit(1)
         while True:
-            try:
-                with lock:                    
+            with lock:
+                try:
                     user, password = self.testing_q.get(timeout=0.1)
-                    if user.should_test_password(self.security_threshold) == USER_STATUS.FOUND:
-                        self.testing_q.task_done()
-                        self.queue_progress.task_done()
-                        continue
-                    if user.samaccountname in self.test_user_lock or user.should_test_password(self.security_threshold) == USER_STATUS.THRESHOLD:
-                        self.testing_q.put([user, password])
-                        self.testing_q.task_done()
-                        continue
+                except queue.Empty as e:
+                    time.sleep(0.1)
+                    continue
 
-                    # Add the user to the lock list so it can not be tested by another thread
-                    self.test_user_lock.append(user.samaccountname)
-                # Can use ldapconnection istead, but no hash authentication implemented
-                user_found = user.test_password(password, conn=self.smbconnection)
-                if user_found:
-                    self.console.log(f"[green]Found: {user.samaccountname} - {password.value}[/green]")
-                self.testing_q.task_done()
-                self.queue_progress.task_done()
-                with lock:
-                    self.test_user_lock.remove(user.samaccountname)
+                if user.should_test_password(self.security_threshold) == USER_STATUS.FOUND:
+                    self.testing_q.task_done()
+                    self.queue_progress.task_done()
+                    continue
+                if user.samaccountname in self.test_user_lock or user.should_test_password(self.security_threshold) == USER_STATUS.THRESHOLD:
+                    self.testing_q.put([user, password])
+                    self.testing_q.task_done()
+                    continue
 
-            except queue.Empty as e:
-                time.sleep(0.1)
-                continue
+                # Add the user to the lock list so it can NOT be tested by another thread to avoid lockout
+                self.test_user_lock.append(user.samaccountname)
+
+            # Can use ldapconnection istead, but no hash authentication implemented
+            user_found = user.test_password(password, conn=self.smbconnection)
+            if user_found:
+                self.console.log(f"[green]Found: {user.samaccountname} - {password.value}[/green]")
+            self.testing_q.task_done()
+            self.queue_progress.task_done()
+            with lock:
+                self.test_user_lock.remove(user.samaccountname)
 
 
 class ThreadPool:
@@ -155,9 +156,12 @@ class ThreadPool:
             open(self.arguments.password_file, 'a').close()
 
         self.progress = QueueProgress()
+        # Add "rich" Progress console to each user for future logging
         for user in self.users:
             user.console = self.progress.progress.console
 
+        # Start one Worker per thread.
+        # Each Worker will retrieve some user/pass from `testing_q` queue and test them
         for i in range(self.max_threads):
             thread = Worker(
                 self.testing_q,
@@ -191,7 +195,7 @@ class ThreadPool:
                         if password.isspace():
                             continue
                         # Remove the trailing \n
-                        password = Password(password[:-1])
+                        password = Password(password.strip())
                         self.all_users_found = self.add_users_password(password, self.progress)
             except FileNotFoundError:
                 pass
@@ -212,17 +216,20 @@ class ThreadPool:
 
             # Remove untestable users from list
             if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
-                user_status == USER_STATUS.UNREADABLE_PSO and self.info and self.console.log(f"Discarding {user.samaccountname}: [red]PSO unreadable. Use -f to force testing[/red]")
+                user_status == USER_STATUS.UNREADABLE_PSO and self.info and self.progress.progress.console.log(f"Discarding {user.samaccountname}: [red]PSO unreadable. Use -f to force testing[/red]")
                 del(self.users[key])
                 continue
-            if user_status != USER_STATUS.FOUND:
-                self.all_users_found = False
+            # This account wasn't found so there's at least one account left.
+            self.all_users_found = False
+
+            # If this (user,password) wasn't already added to the test list, then it should be added
             if user_status in (USER_STATUS.TEST, USER_STATUS.PSO) and not [user, password] in self.tests:
                 if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
-                    self.info and self.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
-                self.debug and self.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
+                    self.info and self.progress.progress.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
+                self.debug and self.progress.progress.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
                 self.testing_q.put([user, password])
                 self.tests.append([user, password])
+                # Add one test (user,password) to progress bar total
                 progress.add_password()
         return self.all_users_found
 

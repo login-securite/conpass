@@ -134,7 +134,6 @@ class LdapConnection:
             return results
 
         except Exception as e:
-            print(e)
             self.console.log("An error occurred while looking for users via LDAP")
             if self.debug:
                 self.console.print_exception()
