@@ -193,7 +193,7 @@ class LdapConnection:
 
         if 'gPLink' not in entry:
             return []
-        res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8'))]
+        res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8')) if dn.lower() in gpos]
         lockout_threshold, lockout_reset = None, None
         for gpo in res:
             if gpo.options & GPO.GPLINK_OPT_DISABLE:
