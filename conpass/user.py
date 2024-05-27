@@ -86,9 +86,13 @@ class User:
         return USER_STATUS.TEST
 
     def update(self, last_password_test, bad_password_count):
-        self.last_password_test = last_password_test
+
         if bad_password_count != self.bad_password_count:
+            self.console.log(f"{self.samaccountname} 'bad_password_count' changed {self.bad_password_count} to {bad_password_count}. {'The user may have entered a bad password' if self.bad_password_count < bad_password_count else 'The user may have logged in'}")
+            self.console.log(f"{self.last_password_test} to {last_password_test}")
             self.bad_password_count = bad_password_count
+
+        self.last_password_test = last_password_test
 
     def should_be_discarded(self):
         # Password already found

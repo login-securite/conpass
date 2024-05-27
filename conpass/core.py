@@ -59,58 +59,35 @@ class Worker(threading.Thread):
         if not self.smbconnection.get_session():
             exit(1)
         while True:
+            try:
+                user, password = self.testing_q.get(timeout=0.1)
+            except queue.Empty as e:
+                time.sleep(0.1)
+                continue
+
             with lock:
-                try:
-                    user, password = self.testing_q.get(timeout=0.1)
-<<<<<<< HEAD
-                except queue.Empty as e:
-                    time.sleep(0.1)
-                    continue
-
-                if user.should_test_password(self.security_threshold) == USER_STATUS.FOUND:
-                    self.testing_q.task_done()
-                    self.queue_progress.task_done()
-                    continue
-                if user.samaccountname in self.test_user_lock or user.should_test_password(self.security_threshold) == USER_STATUS.THRESHOLD:
+                if user.samaccountname in self.test_user_lock:
                     self.testing_q.put([user, password])
                     self.testing_q.task_done()
                     continue
-=======
-                    if user.samaccountname in self.test_user_lock:
-                        self.testing_q.put([user, password])
-                        self.testing_q.task_done()
-                        continue
-                    self.test_user_lock.append(user.samaccountname)
+                self.test_user_lock.append(user.samaccountname)
 
-                should_test_password = user.should_test_password(self.security_threshold, self.ldapconnection)
+            should_test_password = user.should_test_password(self.security_threshold, self.ldapconnection)
 
-                if should_test_password == USER_STATUS.FOUND:
-                    self.testing_q.task_done()
-                    self.queue_progress.task_done()
-                    with lock:
-                        self.test_user_lock.remove(user.samaccountname)
-                    continue
-                elif should_test_password == USER_STATUS.THRESHOLD:
-                    self.testing_q.put([user, password])
-                    self.testing_q.task_done()
-                    with lock:
-                        self.test_user_lock.remove(user.samaccountname)
-                    continue
-
-                # Can use ldapconnection instead, but no hash authentication implemented
-                user_found = user.test_password(password, conn=self.smbconnection)
-                if user_found:
-                    self.console.log(f"[green]Found: {user.samaccountname} - {password.value}[/green]")
+            if should_test_password == USER_STATUS.FOUND:
                 self.testing_q.task_done()
                 self.queue_progress.task_done()
                 with lock:
                     self.test_user_lock.remove(user.samaccountname)
->>>>>>> 1273feb (Check LDAP user for synchronization)
+                continue
+            elif should_test_password == USER_STATUS.THRESHOLD:
+                self.testing_q.put([user, password])
+                self.testing_q.task_done()
+                with lock:
+                    self.test_user_lock.remove(user.samaccountname)
+                continue
 
-                # Add the user to the lock list so it can NOT be tested by another thread to avoid lockout
-                self.test_user_lock.append(user.samaccountname)
-
-            # Can use ldapconnection istead, but no hash authentication implemented
+            # Can use ldapconnection instead, but no hash authentication implemented
             user_found = user.test_password(password, conn=self.smbconnection)
             if user_found:
                 self.console.log(f"[green]Found: {user.samaccountname} - {password.value}[/green]")
@@ -118,7 +95,6 @@ class Worker(threading.Thread):
             self.queue_progress.task_done()
             with lock:
                 self.test_user_lock.remove(user.samaccountname)
-
 
 class ThreadPool:
     def __init__(self, arguments):
