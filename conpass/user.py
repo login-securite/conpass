@@ -33,8 +33,16 @@ class User:
         self.debug and self.console.log(f"\tWhen it can be changed: {self.last_password_test + timedelta(minutes=self.lockout_reset)}")
         self.debug and self.console.log(f"\tServer time:            {datetime.now(timezone.utc) - self.time_delta}")
 
-
-    def should_test_password(self, security_threshold=1):
+    def check_lockout(self, security_threshold):
+        # Skip users with bad password count close to lockout threshold and still in of observation window
+        return self.lockout_threshold > 0 and (
+                self.lockout_threshold <= security_threshold or
+                (
+                        self.bad_password_count >= (self.lockout_threshold - security_threshold)
+                        and (self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=5) > datetime.now(timezone.utc) - self.time_delta)
+                )
+        )
+    def should_test_password(self, security_threshold=1, ldapconnection=None):
         # Checking all PSO applied to user. If one PSO is not readable (access denied), the user should not be tested
         # as the PSO might be more strict than the global password policy
 
@@ -49,12 +57,20 @@ class User:
             return USER_STATUS.FOUND
 
         # Skip users with bad password count close to lockout threshold and still in of observation window
-        if self.lockout_threshold > 0 and (
-                self.lockout_threshold <= security_threshold or
-                (self.bad_password_count >= (self.lockout_threshold-security_threshold) and (self.first_attempt or self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=5) > datetime.now(timezone.utc) - self.time_delta))
-        ):
-            self.first_attempt = False
+        if self.check_lockout(security_threshold):
             return USER_STATUS.THRESHOLD
+
+        # Update user with latest infos in case a real user has entered a bad password
+        # This is only necessary when lockout threshold is > 0 and it is considered to be valid for testing in this tool
+        self.lockout_threshold > 0 and self.update(*ldapconnection.get_user(self.samaccountname))
+
+        # Now, with updated information, check again for lockout risk
+        if self.check_lockout(security_threshold):
+            return USER_STATUS.THRESHOLD
+
+        if self.lockout_threshold > 0 and self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=5) <= datetime.now(timezone.utc) - self.time_delta:
+            # Bad password count is reset to 0
+            self.bad_password_count = 0
 
         if self.lockout_threshold < 0 or self.bad_password_count < (self.lockout_threshold - security_threshold):
             self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
@@ -68,6 +84,11 @@ class User:
         if self.readable_pso() == 1:
             return USER_STATUS.PSO
         return USER_STATUS.TEST
+
+    def update(self, last_password_test, bad_password_count):
+        self.last_password_test = last_password_test
+        if bad_password_count != self.bad_password_count:
+            self.bad_password_count = bad_password_count
 
     def should_be_discarded(self):
         # Password already found

@@ -139,6 +139,24 @@ class LdapConnection:
                 self.console.print_exception()
             return False
 
+    def get_user(self, user):
+        filters = ["(objectClass=User)", "(samAccountName={})".format(user.lower())]
+        filters = '(&' + ''.join(filters) + ')'
+
+        try:
+            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime']
+            res = self.get_paged_objects(filters, ldap_attributes)
+            bad_pwd_count = 0 if 'badPwdCount' not in res[0][1] else int(res[0][1]['badPwdCount'][0])
+            last_pwd_test = datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc) if 'badPasswordTime' not in res[0][1] else utils.win_timestamp_to_datetime(int(res[0][1]['badPasswordTime'][0].decode('utf-8')))
+            return last_pwd_test, bad_pwd_count
+
+        except Exception as e:
+            print(e)
+            self.console.log(f"An error occurred while looking for {user} via LDAP")
+            if self.debug:
+                self.console.print_exception()
+            return False
+
     def get_policy_from_pso(self, pso):
         if pso in self.psos:
             return self.psos[pso]
