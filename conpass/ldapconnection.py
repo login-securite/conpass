@@ -131,7 +131,7 @@ class LdapConnection:
                         console=self.console,
                         debug=self.debug
                     ))
-            return results
+            return {'users': results, 'lockout_threshold': lockout_threshold, 'lockout_reset': lockout_reset}
 
         except Exception as e:
             self.console.log("An error occurred while looking for users via LDAP")

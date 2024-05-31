@@ -135,14 +135,15 @@ class ThreadPool:
             if not session.login(arguments.username, arguments.password):
                 exit(1)
             # Remove users with only 1 try, or <=N tries if `-S N` provided
-            users = self.ldapconnection.get_users(time_delta, disabled=False)
+            results = self.ldapconnection.get_users(time_delta, disabled=False)
+            users = results['users']
             if not users:
                 status.console.log(f"Couldn't retreive users")
                 exit()
             self.users = [user for user in users if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
-            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts (Will stop at ' + str(self.users[0].lockout_threshold - self.arguments.security_threshold) + ')' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")
+            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(results['lockout_threshold']) + ' bad attempts (Will stop at ' + str(results['lockout_threshold'] - self.arguments.security_threshold) + ')' if results['lockout_threshold'] > 0 else '[red]No lockout[/red]' }")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == -1])} users with PSO that [red]can not be read[/red]")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == 1])} users with PSO that [green]can be read[/green]")
         self.threads = []
