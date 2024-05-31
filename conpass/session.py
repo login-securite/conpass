@@ -1,4 +1,4 @@
-from impacket.smbconnection import SMBConnection, SessionError
+from impacket.smbconnection import SMBConnection
 
 from conpass.password import PASSWD_TYPE
 from conpass.ntlminfo import NtlmInfo

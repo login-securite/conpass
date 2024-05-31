@@ -95,7 +95,7 @@ class LdapConnection:
                 self.console.print_exception()
             return False
 
-    def get_users(self, impacketfile, time_delta, users=None, disabled=True):
+    def get_users(self, time_delta, users=None, disabled=True):
         filters = ["(objectClass=User)"]
         if users:
             if len(users) == 1:
@@ -114,7 +114,7 @@ class LdapConnection:
         try:
             ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName', 'msDS-ResultantPSO']
             res = self.get_paged_objects(filters, ldap_attributes)
-            lockout_threshold, lockout_reset = self.get_password_policy(impacketfile)
+            lockout_threshold, lockout_reset = self.get_password_policy()
             results = []
 
             for dn, entry in res:
@@ -188,61 +188,23 @@ class LdapConnection:
             )
         return self.psos[pso]
 
-    def get_password_policy(self, impacketfile):
-        filters = "(&(distinguishedName={}))".format(self.domain_dn)
-        attributes = ['distinguishedName', 'gPLink', 'gPOptions']
+    def get_password_policy(self):
+
+        filter = '(objectClass=domain)'
+        attributes = [
+            'lockoutThreshold',
+            'lockOutObservationWindow'
+        ]
 
         res = self._conn.search_ext(
             self.domain_dn,
             ldap.SCOPE_SUBTREE,
-            filters,
+            filter,
             attributes
         )
         _, rdata, _, _ = self._conn.result3(res)
         dn, entry = rdata[0]
-
-        gpo_distinguished_names = [dn.lower() for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8'))]
-        gpos = self.get_gpos_filepath(impacketfile, gpo_distinguished_names)
-        self.console.log(f"{len(gpo_distinguished_names)} GPOs linked to root domain - {len([gpo for gpo in gpos if gpos[gpo] != (None, None)])} have a password policy")
-        if self.debug:
-            for gpo in gpos:
-                if gpos[gpo] != (None, None):
-                    self.console.log(f"{gpo} policy: Threshold {gpos[gpo][0]} | Reset {gpos[gpo][1]}")
-
-        if 'gPLink' not in entry:
-            return []
-        res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]', flags=re.IGNORECASE).findall(entry['gPLink'][0].decode('utf-8')) if dn.lower() in gpos]
-        lockout_threshold, lockout_reset = None, None
-        for gpo in res:
-            if gpo.options & GPO.GPLINK_OPT_DISABLE:
-                continue
-            if gpo.lockout_threshold is not None:
-                lockout_threshold = gpo.lockout_threshold
-            if gpo.lockout_reset is not None:
-                lockout_reset = gpo.lockout_reset
-
-        if lockout_reset is None:
-            lockout_reset = 0
-        if lockout_threshold is None:
-            lockout_threshold = 0
-        return lockout_threshold, lockout_reset
-
-    def get_gpos_filepath(self, impacketfile, distinguished_names):
-        filters = "(&(objectClass=groupPolicyContainer))"
-        attributes = ['distinguishedName', 'gPCFileSysPath']
-        res = self._conn.search_ext(
-            self.domain_dn,
-            ldap.SCOPE_SUBTREE,
-            filters,
-            attributes
-        )
-        rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
-        ret = {}
-        for dn, entry in rdata:
-            if isinstance(entry, dict) and 'gPCFileSysPath' in entry and dn.lower() in distinguished_names:
-                self.debug and self.console.log(f"Trying to fetch {entry['gPCFileSysPath'][0].decode('utf-8')}")
-                ret[dn.lower()] = GPO.get_password_policy(impacketfile, entry['gPCFileSysPath'][0].decode('utf-8'))
-        return ret
+        return int(entry['lockoutThreshold'][0].decode('utf-8')), int(entry['lockOutObservationWindow'][0].decode('utf-8'))
 
     def get_paged_objects(self, filters, attributes):
         pages = 0

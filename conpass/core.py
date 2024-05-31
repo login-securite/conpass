@@ -14,7 +14,6 @@ from conpass.ldapconnection import LdapConnection
 from conpass.password import Password
 from conpass.user import USER_STATUS
 from conpass.session import Session
-from conpass.impacketfile import ImpacketFile
 
 lock = threading.RLock()
 
@@ -104,6 +103,7 @@ class ThreadPool:
         self.arguments = arguments
         self.console = Console()
         self.console.log("[yellow]This tool does its best to find the effective password policy but may be wrong. Use with caution.[/yellow]")
+        self.console.log("[yellow]Emergency command:[/yellow] [red]Search-ADAccount -LockedOut | Unlock-ADAccount[/red]")
         self.progress = None
         self.info = False
         self.debug = False
@@ -134,13 +134,12 @@ class ThreadPool:
             self.debug and status.console.log(f"UTC DIFF: {time_delta.total_seconds()} seconds")
             if not session.login(arguments.username, arguments.password):
                 exit(1)
-            f = ImpacketFile(session, status.console, debug=self.debug)
             # Remove users with only 1 try, or <=N tries if `-S N` provided
-            users = self.ldapconnection.get_users(f, time_delta, disabled=False)
+            users = self.ldapconnection.get_users(time_delta, disabled=False)
             if not users:
                 status.console.log(f"Couldn't retreive users")
                 exit()
-            self.users = [user for user in self.ldapconnection.get_users(f, time_delta, disabled=False) if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
+            self.users = [user for user in users if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
             status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(self.users[0].lockout_threshold) + ' bad attempts (Will stop at ' + str(self.users[0].lockout_threshold - self.arguments.security_threshold) + ')' if self.users[0].lockout_threshold > 0 else '[red]No lockout[/red]' }")

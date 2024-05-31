@@ -18,7 +18,7 @@ class User:
         self.password = None
         self.last_password_test = last_password_test
         self.bad_password_count = bad_password_count
-        self.lockout_reset = lockout_reset
+        self.lockout_reset = -(lockout_reset/10000000/60)
         self.lockout_threshold = lockout_threshold
         self.pso = pso
         self.first_attempt = True
@@ -28,6 +28,7 @@ class User:
 
         if self.pso is not None and self.pso.readable:
             self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
+
 
         self.debug and self.console.log(f"{self.samaccountname}\tLast pwd test : {self.last_password_test} - Lockout threshold {self.bad_password_count}/{self.lockout_threshold} - Reset {self.lockout_reset} min")
         self.debug and self.console.log(f"\tWhen it can be changed: {self.last_password_test + timedelta(minutes=self.lockout_reset)}")
@@ -70,9 +71,10 @@ class User:
 
         if self.lockout_threshold > 0 and self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=5) <= datetime.now(timezone.utc) - self.time_delta:
             # Bad password count is reset to 0
+            self.debug and self.console.log(f"{self.samaccountname} - Reset {self.lockout_reset} min has passed, bad_password_count reset")
             self.bad_password_count = 0
 
-        if self.lockout_threshold < 0 or self.bad_password_count < (self.lockout_threshold - security_threshold):
+        if self.lockout_threshold > 0 or self.bad_password_count < (self.lockout_threshold - security_threshold):
             self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
         else:
             self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
