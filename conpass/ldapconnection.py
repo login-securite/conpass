@@ -5,11 +5,28 @@
 
 import ldap
 from ldap.controls import SimplePagedResultsControl
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 
+from conpass.pso import PSO
 from conpass.user import User
 from conpass.gpo import GPO
+from conpass import utils
+import struct
+
+def convert(binary):
+    version = struct.unpack('B', binary[0:1])[0]
+    # I do not know how to treat version != 1 (it does not exist yet)
+    assert version == 1, version
+    length = struct.unpack('B', binary[1:2])[0]
+    authority = struct.unpack(b'>Q', b'\x00\x00' + binary[2:8])[0]
+    string = 'S-%d-%d' % (version, authority)
+    binary = binary[8:]
+    assert len(binary) == 4 * length
+    for i in range(length):
+        value = struct.unpack('<L', binary[4*i:4*(i+1)])[0]
+        string += '-%d' % value
+    return string
 
 
 class LdapConnection:
@@ -29,7 +46,7 @@ class LdapConnection:
         self.domain_dn = None
         self._conn = None
         self.domain_threshold = 0
-        self.granular_threshold = {}  # keys are policy DNs
+        self.psos = {}
         self.domain_dn = self.get_domain_dn()
         if self.domain_dn is None:
             self.console.log(f"Error: Unable to get domain DN from {self.domain}. Please provide full domain name (e.g. example.com)")
@@ -78,7 +95,7 @@ class LdapConnection:
                 self.console.print_exception()
             return False
 
-    def get_users(self, impacketfile, users=None, disabled=True):
+    def get_users(self, time_delta, users=None, disabled=True):
         filters = ["(objectClass=User)"]
         if users:
             if len(users) == 1:
@@ -95,81 +112,101 @@ class LdapConnection:
         else:
             filters = filters[0]
         try:
-            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName']
-            res = self.get_paged_users(filters, ldap_attributes)
-            lockout_threshold, lockout_reset = self.get_password_policy(impacketfile)
-            results = [
-                User(
-                    samaccountname=entry['sAMAccountName'][0].decode('utf-8'),
-                    bad_password_count=0 if 'badPwdCount' not in entry else int(entry['badPwdCount'][0]),
-                    last_password_test=datetime.fromtimestamp(int((int(entry['badPasswordTime'][0].decode('utf-8')) / 10000000 - 11644473600))),
-                    lockout_threshold=lockout_threshold,
-                    lockout_reset=lockout_reset
-                ) for dn, entry in res if isinstance(entry, dict) and entry['sAMAccountName'][0].decode('utf-8')[-1] != '$'
-            ]
+            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName', 'msDS-ResultantPSO']
+            res = self.get_paged_objects(filters, ldap_attributes)
+            lockout_threshold, lockout_reset = self.get_password_policy()
+            results = []
 
-            return results
+            for dn, entry in res:
+                if isinstance(entry, dict) and entry['sAMAccountName'][0].decode('utf-8')[-1] != '$':
+                    results.append(User(
+                        samaccountname=entry['sAMAccountName'][0].decode('utf-8'),
+                        dn=entry['distinguishedName'][0].decode('utf-8'),
+                        bad_password_count=0 if 'badPwdCount' not in entry else int(entry['badPwdCount'][0]),
+                        last_password_test=datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc) if 'badPasswordTime' not in entry else utils.win_timestamp_to_datetime(int(entry['badPasswordTime'][0].decode('utf-8'))),
+                        lockout_threshold=lockout_threshold,
+                        lockout_reset=lockout_reset,
+                        pso=None if 'msDS-ResultantPSO' not in entry else self.get_policy_from_pso(entry['msDS-ResultantPSO'][0]),
+                        time_delta=time_delta,
+                        console=self.console,
+                        debug=self.debug
+                    ))
+            return {'users': results, 'lockout_threshold': lockout_threshold, 'lockout_reset': lockout_reset}
+
         except Exception as e:
             self.console.log("An error occurred while looking for users via LDAP")
             if self.debug:
                 self.console.print_exception()
             return False
 
-    def get_password_policy(self, impacketfile):
-        filters = "(&(distinguishedName={}))".format(self.domain_dn)
-        attributes = ['distinguishedName', 'gPLink', 'gPOptions']
+    def get_user(self, user):
+        filters = ["(objectClass=User)", "(samAccountName={})".format(user.lower())]
+        filters = '(&' + ''.join(filters) + ')'
+
+        try:
+            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime']
+            res = self.get_paged_objects(filters, ldap_attributes)
+            bad_pwd_count = 0 if 'badPwdCount' not in res[0][1] else int(res[0][1]['badPwdCount'][0])
+            last_pwd_test = datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc) if 'badPasswordTime' not in res[0][1] else utils.win_timestamp_to_datetime(int(res[0][1]['badPasswordTime'][0].decode('utf-8')))
+            return last_pwd_test, bad_pwd_count
+
+        except Exception as e:
+            print(e)
+            self.console.log(f"An error occurred while looking for {user} via LDAP")
+            if self.debug:
+                self.console.print_exception()
+            return False
+
+    def get_policy_from_pso(self, pso):
+        if pso in self.psos:
+            return self.psos[pso]
+
+        attributes = ['msDS-LockoutThreshold', 'msDS-PasswordSettingsPrecedence', 'msDS-LockoutObservationWindow', 'msDS-LockoutDuration']
+        pso = pso.decode('utf-8')
+        
+        res = self._conn.search_ext(
+            pso,
+            ldap.SCOPE_SUBTREE,
+            attrlist=attributes
+        )
+
+        try:
+            rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
+        except ldap.NO_SUCH_OBJECT as e:
+            self.psos[pso] = PSO(dn=pso, readable=False)
+            return self.psos[pso]
+        dn, entry = rdata[0]
+        if 'msDS-LockoutThreshold' not in entry:
+            self.psos[pso] = PSO(dn=pso, readable=False)
+        else:
+            self.psos[pso] = PSO(
+                pso,
+                int(entry['msDS-LockoutThreshold'][0].decode('utf-8')),
+                int(entry['msDS-LockoutObservationWindow'][0].decode('utf-8')),
+                int(entry['msDS-LockoutDuration'][0].decode('utf-8')),
+                int(entry['msDS-PasswordSettingsPrecedence'][0].decode('utf-8'))
+            )
+        return self.psos[pso]
+
+    def get_password_policy(self):
+
+        filter = '(objectClass=domain)'
+        attributes = [
+            'lockoutThreshold',
+            'lockOutObservationWindow'
+        ]
 
         res = self._conn.search_ext(
             self.domain_dn,
             ldap.SCOPE_SUBTREE,
-            filters,
+            filter,
             attributes
         )
         _, rdata, _, _ = self._conn.result3(res)
         dn, entry = rdata[0]
+        return int(entry['lockoutThreshold'][0].decode('utf-8')), int(entry['lockOutObservationWindow'][0].decode('utf-8'))
 
-        gpo_distinguished_names = [dn.lower() for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]').findall(entry['gPLink'][0].decode('utf-8'))]
-
-        gpos = self.get_gpos_filepath(impacketfile, gpo_distinguished_names)
-        self.console.log(f"{len(gpo_distinguished_names)} GPOs linked to root domain - {len([gpo for gpo in gpos if gpos[gpo] != (None, None)])} have a password policy")
-
-        if 'gPLink' not in entry:
-            return []
-        res = [GPO(dn.lower(), int(options), *gpos[dn.lower()]) for dn, options in re.compile(r'\[LDAP://(cn=.*?);(\d+)]').findall(entry['gPLink'][0].decode('utf-8'))]
-
-        lockout_threshold, lockout_reset = None, None
-        for gpo in res:
-            if gpo.options & GPO.GPLINK_OPT_DISABLE:
-                continue
-            if gpo.lockout_threshold is not None:
-                lockout_threshold = gpo.lockout_threshold
-            if gpo.lockout_reset is not None:
-                lockout_reset = gpo.lockout_reset
-
-        if lockout_reset is None:
-            lockout_reset = 0
-        if lockout_threshold is None:
-            lockout_threshold = 0
-
-        return lockout_threshold, lockout_reset
-
-    def get_gpos_filepath(self, impacketfile, distinguished_names):
-        filters = "(&(objectClass=groupPolicyContainer))"
-        attributes = ['distinguishedName', 'gPCFileSysPath']
-        res = self._conn.search_ext(
-            self.domain_dn,
-            ldap.SCOPE_SUBTREE,
-            filters,
-            attributes
-        )
-        rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
-        ret = {}
-        for dn, entry in rdata:
-            if isinstance(entry, dict) and 'gPCFileSysPath' in entry and dn.lower() in distinguished_names:
-                ret[dn.lower()] = GPO.get_password_policy(impacketfile, entry['gPCFileSysPath'][0].decode('utf-8'))
-        return ret
-
-    def get_paged_users(self, filters, attributes):
+    def get_paged_objects(self, filters, attributes):
         pages = 0
         result = []
 

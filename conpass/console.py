@@ -5,8 +5,6 @@ from conpass.core import ThreadPool
 
 
 def main():
-    # user = User(samaccountname='Administrator', last_password_test=None, lockout_threshold=0, bad_password_count=0)
-
     """
     Command line function to call conpass
     """
@@ -24,18 +22,19 @@ def main():
                             help='IP Address of the primary domain controller.')
 
     group_spray = parser.add_argument_group('Spray')
-    group_spray.add_argument('-P', '--password-file', action='store', help='File containing passwords to test',
-                            required=True)
+    group_spray.add_argument('-P', '--password-file', action='store', help='File containing passwords to test', required=True)
+    group_spray.add_argument('-S', '--security-threshold', default=1, type=int, action='store', help='Specifies the number of remaining attempts allowed before reaching the lockout threshold (Default: 1)')
     group_auth.add_argument('--threads', default=10, type=int, action='store', help='Threads number (Default 10)')
 
     group_info = parser.add_argument_group('Info')
-    group_info.add_argument('-v', '--verbose', action='store_true', help='Get debug information')
+    group_info.add_argument('-v', action='count', default=0, help='Verbosity level (-v or -vv)')
     group_info.add_argument('-V', '--version', action='version', version='%(prog)s (version {})'.format(version))
 
     args = parser.parse_args()
 
     ThreadPool(args).run()
 
-
+# TODO
+# Vérifier sur LDAP que le badpwdcount est synchro. Faut le remettre à 0 par exemple après un observation windows. Est-ce qu'on peut pas aller recup le compte LDAP à ce moment là ? Pas si souvent ...
 if __name__ == "__main__":
     main()
