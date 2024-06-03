@@ -6,6 +6,8 @@
 
 Python tool for continuous password spraying taking into account the password policy.
 
+Associated blogpost [FR]: https://www.login-securite.com/2024/06/03/spray-passwords-avoid-lockouts/
+
 | Chapters                                | Description                                     |
 |-----------------------------------------|-------------------------------------------------|
 | [Warning](#warning)                     | Before using this tool, read this               |
