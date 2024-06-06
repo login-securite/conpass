@@ -13,7 +13,7 @@ README = (HERE / "README.md").read_text()
 
 setup(
     name="conpass",
-    version="0.0.1",
+    version="0.1.0",
     author="Pixis",
     author_email="hackndo@gmail.com",
     description="Continuous password spraying tool",
