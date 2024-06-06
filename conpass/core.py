@@ -14,6 +14,7 @@ from conpass.ldapconnection import LdapConnection
 from conpass.password import Password
 from conpass.user import USER_STATUS
 from conpass.session import Session
+from conpass.utils import get_list_from_file
 
 lock = threading.RLock()
 
@@ -42,7 +43,7 @@ class QueueProgress:
 
 
 class Worker(threading.Thread):
-    def __init__(self, testing_q, test_user_lock, ldapconnection, smbconnection, queue_progress, security_threshold=1):
+    def __init__(self, testing_q, test_user_lock, ldapconnection, smbconnection, queue_progress, security_threshold=2):
         super().__init__()
         self.testing_q = testing_q
         self.test_user_lock = test_user_lock
@@ -134,8 +135,15 @@ class ThreadPool:
             self.debug and status.console.log(f"UTC DIFF: {time_delta.total_seconds()} seconds")
             if not session.login(arguments.username, arguments.password):
                 exit(1)
+            users = None
+            if self.arguments.user_file:
+                import os.path
+                if not os.path.isfile(self.arguments.user_file):
+                    status.console.log(f"File {self.arguments.user_file} does not exist")
+                    exit()
+                users = get_list_from_file(self.arguments.user_file)
             # Remove users with only 1 try, or <=N tries if `-S N` provided
-            results = self.ldapconnection.get_users(time_delta, disabled=False)
+            results = self.ldapconnection.get_users(time_delta, users=users, disabled=False)
             users = results['users']
             if not users:
                 status.console.log(f"Couldn't retreive users")
@@ -143,7 +151,7 @@ class ThreadPool:
             self.users = [user for user in users if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
 
             status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
-            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(results['lockout_threshold']) + ' bad attempts (Will stop at ' + str(results['lockout_threshold'] - self.arguments.security_threshold) + ')' if results['lockout_threshold'] > 0 else '[red]No lockout[/red]' }")
+            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(results['lockout_threshold']) + ' bad attempts (Will stop at ' + str(results['lockout_threshold'] - self.arguments.security_threshold) + ') - Observation window: ' + str(int(-results['lockout_reset']/10000000/60)) + ' min' if results['lockout_threshold'] > 0 else '[red]No lockout[/red]' }")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == -1])} users with PSO that [red]can not be read[/red]")
             status.console.log(f"{len([user for user in self.users if user.readable_pso() == 1])} users with PSO that [green]can be read[/green]")
         self.threads = []

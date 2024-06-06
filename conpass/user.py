@@ -69,7 +69,7 @@ class User:
         if self.check_lockout(security_threshold):
             return USER_STATUS.THRESHOLD
 
-        if self.lockout_threshold > 0 and self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=5) <= datetime.now(timezone.utc) - self.time_delta:
+        if self.lockout_threshold > 0 and self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=1) <= datetime.now(timezone.utc) - self.time_delta:
             # Bad password count is reset to 0
             self.debug and self.console.log(f"{self.samaccountname} - Reset {self.lockout_reset} min has passed, bad_password_count reset")
             self.bad_password_count = 0
@@ -90,7 +90,7 @@ class User:
     def update(self, last_password_test, bad_password_count):
 
         if bad_password_count != self.bad_password_count:
-            self.console.log(f"{self.samaccountname} 'bad_password_count' changed {self.bad_password_count} to {bad_password_count}. {'The user may have entered a bad password' if self.bad_password_count < bad_password_count else 'The user may have logged in'}")
+            self.console.log(f"{self.samaccountname} 'bad_password_count' changed from {self.bad_password_count} to {bad_password_count}. {'The user may have entered a bad password' if self.bad_password_count < bad_password_count else 'The user may have logged in'}")
             self.console.log(f"{self.last_password_test} to {last_password_test}")
             self.bad_password_count = bad_password_count
 

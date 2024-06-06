@@ -23,7 +23,8 @@ def main():
 
     group_spray = parser.add_argument_group('Spray')
     group_spray.add_argument('-P', '--password-file', action='store', help='File containing passwords to test', required=True)
-    group_spray.add_argument('-S', '--security-threshold', default=1, type=int, action='store', help='Specifies the number of remaining attempts allowed before reaching the lockout threshold (Default: 1)')
+    group_spray.add_argument('-U', '--user-file', action='store', help='File containing usernames to test (Default all domain users)', required=False)
+    group_spray.add_argument('-S', '--security-threshold', default=2, type=int, action='store', help='Specifies the number of remaining attempts allowed before reaching the lockout threshold (Default: 2)')
     group_auth.add_argument('--threads', default=10, type=int, action='store', help='Threads number (Default 10)')
 
     group_info = parser.add_argument_group('Info')
@@ -34,7 +35,6 @@ def main():
 
     ThreadPool(args).run()
 
-# TODO
-# Vérifier sur LDAP que le badpwdcount est synchro. Faut le remettre à 0 par exemple après un observation windows. Est-ce qu'on peut pas aller recup le compte LDAP à ce moment là ? Pas si souvent ...
+
 if __name__ == "__main__":
     main()
