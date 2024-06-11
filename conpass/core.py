@@ -62,7 +62,7 @@ class Worker(threading.Thread):
             try:
                 user, password = self.testing_q.get(timeout=0.1)
             except queue.Empty as e:
-                time.sleep(0.1)
+                time.sleep(0.5)
                 continue
 
             with lock:
@@ -212,19 +212,19 @@ class ThreadPool:
                             continue
                         # Remove the trailing \n
                         password = Password(password.strip())
-                        self.all_users_found = self.add_users_password(password, self.progress)
+                        self.all_users_found = self.add_users_password(password, self.progress, self.arguments.limit_memory)
             except FileNotFoundError:
                 pass
             if self.all_users_found:
                 self.console.log(f'\n** All users passwords found! **')
                 break
-            time.sleep(0.1)
+            time.sleep(0.5)
 
         # Block until all tasks are done
         self.testing_q.join()
 
     # Add the users/password combination to the queue
-    def add_users_password(self, password, progress):
+    def add_users_password(self, password, progress, limit_memory=False):
         self.all_users_found = True
         for key, user in enumerate(self.users):
             # Check if user should be tested, depending on lockout policy and PSO
@@ -243,6 +243,9 @@ class ThreadPool:
                 if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
                     self.info and self.progress.progress.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
                 self.debug and self.progress.progress.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
+                # Avoid super big queue to save memory
+                while self.testing_q.qsize() > 30 and limit_memory:
+                    time.sleep(0.5)
                 self.testing_q.put([user, password])
                 self.tests.append([user, password])
                 # Add one test (user,password) to progress bar total

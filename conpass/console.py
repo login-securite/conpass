@@ -26,6 +26,7 @@ def main():
     group_spray.add_argument('-U', '--user-file', action='store', help='File containing usernames to test (Default all domain users)', required=False)
     group_spray.add_argument('-S', '--security-threshold', default=2, type=int, action='store', help='Specifies the number of remaining attempts allowed before reaching the lockout threshold (Default: 2)')
     group_auth.add_argument('--threads', default=10, type=int, action='store', help='Threads number (Default 10)')
+    group_auth.add_argument('--limit-memory', action='store_true', help='Limit the size of internal queues. Could be useful for 10k users and more')
 
     group_info = parser.add_argument_group('Info')
     group_info.add_argument('-v', action='count', default=0, help='Verbosity level (-v or -vv)')
