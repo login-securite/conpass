@@ -43,7 +43,7 @@ class LdapConnection:
         try:
             self.__conn.search(search_base, search_filter, attributes=attributes)
         except Exception as e:
-            self.__console.log(f"[red]An error occurred while retrieving default domain policy: {str(e)}[/red]")
+            self.__console.print(f"[red]An error occurred while retrieving default domain policy: {str(e)}[/red]")
             raise
         entry = self.__conn.entries[0]
         return PasswordPolicy(
@@ -70,7 +70,7 @@ class LdapConnection:
         self.__can_read_psos = True
 
         if len(self.__conn.entries) == 0:
-            self.__console.log(f"No PSO found")
+            self.__console.print(f"No PSO found")
         return [
             PasswordPolicy(
                 name=entry.name.value if entry.name else None,
@@ -110,7 +110,7 @@ class LdapConnection:
                 if not cookie:
                     break
         except Exception as e:
-            self.__console.log(f"[red]An error occurred while retrieving active users: {str(e)}[/red]")
+            self.__console.print(f"[red]An error occurred while retrieving active users: {str(e)}[/red]")
             raise
 
         users = []
@@ -139,7 +139,7 @@ class LdapConnection:
 
             # TODO Check if < or <= here, depending on further tests. <= to be sure
             if 0 < lockout_threshold <= security_threshold:
-                self.__console.log(f"{entry.samAccountName} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
+                self.__console.print(f"{entry.samAccountName} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
                 continue
 
             user = User(
@@ -162,7 +162,7 @@ class LdapConnection:
         for pso in psos:
             if pso.name == name:
                 return pso
-        self.__console.log(f"[yellow]PSO [blue]{name}[/blue] details couldn't be found")
+        self.__console.print(f"[yellow]PSO [blue]{name}[/blue] details couldn't be found")
         return None
 
 

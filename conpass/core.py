@@ -1,40 +1,14 @@
 import signal
 import threading
 import time
-from datetime import datetime, timezone
 
-from impacket.smbconnection import SMBConnection
 from rich.progress import Progress
 
 from conpass.ldapconnection import LdapConnection
 from conpass.session import Session
 from conpass.user import User
-from conpass.utils.ntlminfo import NtlmInfo
 
 lock = threading.RLock()
-
-
-class QueueProgress:
-    processing = "[green] Processing password file..."
-    waiting = "[green] Waiting for new passwords..."
-
-    def __init__(self, console):
-        self.progress = Progress(console=console)
-        self.task = self.progress.add_task(QueueProgress.waiting, total=0)
-        self.progress.start()
-
-    def add_password(self):
-        self.progress.update(self.task, total=self.progress.tasks[self.task].total + 1)
-        if self.progress.tasks[self.task].description == QueueProgress.waiting:
-            self.progress.update(self.task, description=QueueProgress.processing)
-
-    def task_done(self):
-        self.progress.update(self.task, advance=1)
-        if self.progress.tasks[self.task].completed == self.progress.tasks[self.task].total:
-            self.progress.update(self.task, description=QueueProgress.waiting)
-
-    def stop(self):
-        self.progress.stop()
 
 
 class Worker(threading.Thread):
@@ -61,9 +35,9 @@ class Worker(threading.Thread):
                             continue
                         user.lock()
 
-                    #self.__console.log(f"{self.__tid} Trying {user.samaccountname} - {password}")
+                    #self.__console.print(f"{self.__tid} Trying {user.samaccountname} - {password}")
                     if user.test_password(password, self.__smb_connection):
-                        self.__console.log(f"Found: [yellow]{user.samaccountname} - {password}[/yellow]")
+                        self.__console.print(f"Found: [yellow]{user.samaccountname} - {password}[/yellow]")
                     user.unlock()
 
 class ThreadPool:
@@ -125,7 +99,7 @@ class ThreadPool:
         if self.__dc_ip is None:
             self.__dc_host, self.__dc_ip = Session.get_dc_details(self.__domain)
         self.__time_delta = Session.get_time_delta(self.__dc_ip, self.__dc_host)
-        self.__console.log(f"Time difference with '{self.__dc_host}': {self.__time_delta.total_seconds()} seconds")
+        self.__console.print(f"Time difference with '{self.__dc_host}': {self.__time_delta.total_seconds()} seconds")
         if self.__username is not None:
             try:
                 self.__ldap_connection = LdapConnection(
@@ -141,37 +115,37 @@ class ThreadPool:
                 self.__console.error(f"Error in LDAP: {str(e)}")
                 raise e
             if not self.__ldap_connection.login():
-                self.__console.log(f"[red]LDAP bind failed[/red]")
+                self.__console.print(f"[red]LDAP bind failed[/red]")
                 exit()
 
-            self.__console.log(f"Successfully connected to '{self.__dc_host}' via LDAP")
+            self.__console.print(f"Successfully connected to '{self.__dc_host}' via LDAP")
 
             self.__console.rule('Default Domain Policy')
             self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
-            self.__console.log(f'Lockout Threshold: {self.__default_domain_policy.lockout_threshold}')
-            self.__console.log(f'Lockout Window: {self.__default_domain_policy.lockout_window}')
+            self.__console.print(f'Lockout Threshold: {self.__default_domain_policy.lockout_threshold}')
+            self.__console.print(f'Lockout Window: {self.__default_domain_policy.lockout_window}')
 
             self.__console.rule('Password Security Objects')
             self.__psos = self.__ldap_connection.get_psos_details()
             if self.__ldap_connection.can_read_pso():
                 for pso in self.__psos:
-                    self.__console.log(f'[blue]{pso.name}[/blue]')
-                    self.__console.log(f'Lockout Threshold: {pso.lockout_threshold}')
-                    self.__console.log(f'Lockout Window: {pso.lockout_window}')
+                    self.__console.print(f'[blue]{pso.name}[/blue]')
+                    self.__console.print(f'Lockout Threshold: {pso.lockout_threshold}')
+                    self.__console.print(f'Lockout Window: {pso.lockout_window}')
             else:
-                self.__console.log(f'[yellow]Can NOT read PSO details')
+                self.__console.print(f'[yellow]Can NOT read PSO details')
 
             self.__console.rule('Active Users')
             res = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta, self.__security_threshold)
             self.__users = res['users']
             statistics = res['stats']
-            self.__console.log(f"Total users: {statistics['total_users']}")
-            self.__console.log(f"Users without PSO: {len([user for user in self.__users if user.pso is None])}")
+            self.__console.print(f"Total users: {statistics['total_users']}")
+            self.__console.print(f"Users without PSO: {len([user for user in self.__users if user.pso is None])}")
             for pso, total in statistics['pso'].items():
-                self.__console.log(f"[blue]{pso}[/blue]: {total} user{' ([red]Details can NOT be read[/red])' if not self.__ldap_connection.can_read_pso() else ''}")
-            self.__console.log(f"Total sprayed users: {len(self.__users)}")
+                self.__console.print(f"[blue]{pso}[/blue]: {total} user{' ([red]Details can NOT be read[/red])' if not self.__ldap_connection.can_read_pso() else ''}")
+            self.__console.print(f"Total sprayed users: {len(self.__users)}")
         else:
-            self.__console.log("[yellow]Building users list based on provided password policy. No online checks will be made.[/yellow]")
+            self.__console.print("[yellow]Building users list based on provided password policy. No online checks will be made.[/yellow]")
             # No user provided so users list is constructed based on information given in parameters
             with open(self.__user_file, 'r') as f:
                 for username in f:
@@ -232,7 +206,7 @@ class ThreadPool:
                     progress.update(progress_task, completed=completed)
 
                 except FileNotFoundError:
-                    self.__console.log(f"[red]Password file can not be found. Quitting.[/red]")
+                    self.__console.print(f"[red]Password file can not be found. Quitting.[/red]")
                     break
                 time.sleep(1)
     def __preflight_checks(self):
@@ -240,5 +214,5 @@ class ThreadPool:
 
 
     def interrupt_event(self, signum, stack):
-        self.__console.log(f"[red]** Interrupted! **[/red]")
+        self.__console.print(f"[red]** Interrupted! **[/red]")
         exit()

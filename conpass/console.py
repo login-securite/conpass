@@ -1,13 +1,11 @@
 from pathlib import Path
 from typing import Annotated
-import os
 
 import typer
 from rich.console import Console
-from rich.prompt import Prompt
 
-from conpass.utils.logger import get_logger
 from conpass.core import ThreadPool
+from conpass.utils.logger import get_logger
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
 
