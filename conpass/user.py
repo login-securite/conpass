@@ -88,21 +88,24 @@ class User:
         return USER_STATUS.TEST
 
     def update(self, last_password_test, bad_password_count):
-
-        if bad_password_count != self.bad_password_count:
-            update_text = f"{self.samaccountname} 'badPwdCount' changed from {self.bad_password_count} to {bad_password_count}"
-            self.console.log()
-            if self.last_password_test > last_password_test:
-                self.console.log(f"{update_text} - You may have tried the N-1 or N-2 user's password!")
-            else:
-                if self.bad_password_count > bad_password_count:
-                    self.console.log(f"{update_text} - The user may have logged in")
+        if bad_password_count == 0 and last_password_test == datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc):
+            print("KO")
+            pass
+        else:
+            if bad_password_count != self.bad_password_count:
+                update_text = f"{self.samaccountname} 'badPwdCount' changed from {self.bad_password_count} to {bad_password_count}"
+                self.console.log()
+                if self.last_password_test > last_password_test:
+                    self.console.log(f"{update_text} - You may have tried the N-1 or N-2 user's password!")
                 else:
-                    self.console.log(f"{update_text} - The user may have entered a bad password")
-            self.console.log(f"{self.last_password_test} to {last_password_test}")
-            self.bad_password_count = bad_password_count
+                    if self.bad_password_count > bad_password_count:
+                        self.console.log(f"{update_text} - The user may have logged in")
+                    else:
+                        self.console.log(f"{update_text} - The user may have entered a bad password")
+                self.console.log(f"{self.last_password_test} to {last_password_test}")
+                self.bad_password_count = bad_password_count
 
-        self.last_password_test = last_password_test
+            self.last_password_test = last_password_test
 
     def should_be_discarded(self):
         # Password already found
