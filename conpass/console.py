@@ -1,42 +1,210 @@
-import argparse
+from pathlib import Path
+from typing import Annotated
+import os
 
-from conpass import __version__
+import typer
+from rich.console import Console
+from rich.prompt import Prompt
+
+from conpass.utils.logger import get_logger
 from conpass.core import ThreadPool
 
-
-def main():
-    """
-    Command line function to call conpass
-    """
-    version = __version__
-    parser = argparse.ArgumentParser(
-        prog="conpass",
-        description='conpass v{} - Continuous password spraying tool'.format(__version__)
-    )
-
-    group_auth = parser.add_argument_group('Authentication')
-    group_auth.add_argument('-u', '--username', action='store', help='Username', required=True)
-    group_auth.add_argument('-p', '--password', action='store', help='Plaintext password', required=True)
-    group_auth.add_argument('-d', '--domain', default="", action='store', help='Domain name', required=True)
-    group_auth.add_argument('-dc-ip', action='store', metavar="ip address",
-                            help='IP Address of the primary domain controller.')
-
-    group_spray = parser.add_argument_group('Spray')
-    group_spray.add_argument('-P', '--password-file', action='store', help='File containing passwords to test', required=True)
-    group_spray.add_argument('-U', '--user-file', action='store', help='File containing usernames to test (Default all domain users)', required=False)
-    group_spray.add_argument('-S', '--security-threshold', default=2, type=int, action='store', help='Specifies the number of remaining attempts allowed before reaching the lockout threshold (Default: 2)')
-    group_auth.add_argument('--threads', default=10, type=int, action='store', help='Threads number (Default 10)')
-    group_auth.add_argument('--limit-memory', action='store_true', help='Limit the size of internal queues. Could be useful for 10k users and more')
-    group_auth.add_argument('--user-as-pass', action='store_true', help='Add user-as-pass in password spray')
-
-    group_info = parser.add_argument_group('Info')
-    group_info.add_argument('-v', action='count', default=0, help='Verbosity level (-v or -vv)')
-    group_info.add_argument('-V', '--version', action='version', version='%(prog)s (version {})'.format(version))
-
-    args = parser.parse_args()
-
-    ThreadPool(args).run()
+app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
 
 
-if __name__ == "__main__":
-    main()
+def complete_path():  # Typer bug : https://github.com/fastapi/typer/issues/951
+    return []
+
+
+@app.command(
+    help='Spray given passwords to all Active Directory users and taking password policies into account',
+)
+def spray(
+
+    domain: Annotated[
+        str,
+        typer.Option("--domain", "-d", help="Domain name", rich_help_panel="Authentication"),
+    ],
+    password_file: Annotated[
+        Path,
+        typer.Option(
+            "--password-file",
+            "-P",
+            exists=True,
+            file_okay=True,
+            readable=True,
+            resolve_path=True,
+            help="File containing passwords to test",
+            autocompletion=complete_path,
+            rich_help_panel="Spray",
+        ),
+    ],
+    username: Annotated[
+        str | None,
+        typer.Option("--username", "-u", help="Domain user", rich_help_panel="Authentication"),
+    ] = None,
+    password: Annotated[
+        str | None,
+        typer.Option(
+            "--password",
+            "-p",
+            help="Domain password",
+            rich_help_panel="Authentication"
+        ),
+    ] = None,
+    hashes: Annotated[
+        str | None,
+        typer.Option(
+            "--hashes",
+            "-H",
+            help="NTLM hashes, format is LMHASH:NTHASH",
+            rich_help_panel="Authentication",
+        ),
+    ] = None,
+    user_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--user-file",
+            "-U",
+            exists=True,
+            file_okay=True,
+            readable=True,
+            resolve_path=True,
+            help="File containing users to test",
+            autocompletion=complete_path,
+            rich_help_panel="Spray",
+        ),
+    ] = None,
+    lockout_threshold: Annotated[
+        int | None,
+        typer.Option(
+            "--lockout-threshold",
+            "-t",
+            help="Manually provide lockout threshold (Necessary when users list if provided)",
+            rich_help_panel="Spray",
+        ),
+    ] = None,
+    lockout_observation_window: Annotated[
+        int | None,
+        typer.Option(
+            "--lockout-observation-window",
+            "-o",
+            help="Manually provide lockout observation window in seconds (Necessary when users list if provided)",
+            rich_help_panel="Spray",
+        ),
+    ] = None,
+    user_as_pass: Annotated[
+        bool | None,
+        typer.Option(
+            "--user-as-pass",
+            "-a",
+            help="Enables user-as-pass for each user",
+            rich_help_panel="Spray",
+        ),
+    ] = False,
+    security_threshold: Annotated[
+        int | None,
+        typer.Option(
+            "--security-threshold",
+            "-s",
+            help="Specifies the number of remaining attempts allowed before reaching the lockout threshold",
+            rich_help_panel="Spray",
+        ),
+    ] = 2,
+    max_threads: Annotated[
+        int | None,
+        typer.Option(
+            "--max-threads",
+            "-m",
+            help="Max threads number",
+            rich_help_panel="Spray",
+        ),
+    ] = 10,
+    limit_memory: Annotated[
+        bool | None,
+        typer.Option(
+            "--limit-memory",
+            "-l",
+            help="Limit the size of internal queues. Could be useful for 10k users and more",
+            rich_help_panel="Spray",
+        ),
+    ] = False,
+    dc_ip: Annotated[
+        str | None,
+        typer.Option("--dc-ip", "-D", help="Primary domain controller IP address", rich_help_panel="Authentication"),
+    ] = None,
+    dc_host: Annotated[
+        str | None,
+        typer.Option(
+            "--dc-host",
+            help="Hostname of the domain controller. If omitted it uses the --dc-ip or --domain",
+            rich_help_panel="Authentication",
+        ),
+    ] = None,
+
+    use_kerberos: Annotated[
+        bool,
+        typer.Option(
+            "--kerberos",
+            "-k",
+            help="Uses kerberos authentication. Grabs credentials from ccache file (KRB5CCNAME) based on target parameters",
+            rich_help_panel="Authentication",
+        ),
+    ] = False,
+    aes_key: Annotated[
+        str | None,
+        typer.Option(
+            "--aes-key",
+            "-a",
+            help="AES key to use for Kerberos Authentication (128 or 256 bits)",
+            rich_help_panel="Authentication",
+        ),
+    ] = None,
+
+
+):
+    console = Console()
+    logger = get_logger(console)
+    if username is None and user_file is None:
+        logger.error("Either --username or --users-file is required")
+        raise typer.Exit(code=1)
+    if '.' not in domain:
+        logger.error(f"Provide fully qualified domain name (e.g. domain.local instead of DOMAIN)")
+        raise typer.Exit(code=1)
+
+    if username is not None and password is None and hashes is None and (use_kerberos is False or aes_key is None):
+        logger.error(f"--password or --hashes{' or --aes-key' if use_kerberos else ''} is required for authentication")
+        raise typer.Exit(code=1)
+
+    if len([c for c in (password, hashes, aes_key) if c is not None]) > 1:
+        logger.error("Only one secret can be provided")
+        raise typer.Exit(code=1)
+
+    if user_file and (not lockout_threshold or not lockout_observation_window):
+        logger.error("When using --users-file, --lockout-threshold and --lockout-observation-window are required")
+        raise typer.Exit(code=1)
+
+    try:
+        thread_pool = ThreadPool(
+            username,
+            password,
+            domain,
+            dc_ip,
+            dc_host,
+            use_kerberos,
+            aes_key,
+            hashes,
+            password_file,
+            user_file,
+            lockout_threshold,
+            lockout_observation_window,
+            user_as_pass,
+            security_threshold,
+            max_threads,
+            limit_memory,
+            console
+        )
+        thread_pool.run()
+    except Exception as e:
+        logger.critical(e)
+        raise typer.Exit(code=1) from None

@@ -32,7 +32,6 @@
 import os
 import random
 import string
-from datetime import datetime, timedelta, timezone
 
 from impacket import nmb
 from impacket.dcerpc.v5.rpcrt import *
@@ -41,13 +40,13 @@ from impacket.smb import SMB, NewSMBPacket, SMBCommand, SMBNTLMDialect_Parameter
     SMBNTLMDialect_Data, SMBExtended_Security_Parameters, SMBExtended_Security_Data, UnsupportedFeature, \
     SMB_DIALECT
 from impacket.smb3structs import *
-from impacket.spnego import SPNEGO_NegTokenInit, TypesMech
 
 from conpass import utils
 
+
 class SMB1:
     def __init__(self, remote_name, remote_host, my_name=None,
-                    sess_port=445, timeout=60, session=None, negSessionResponse=None):
+                 sess_port=445, timeout=60, session=None, negSessionResponse=None):
         self._uid = 0
         self._dialects_data = None
         self._SignatureRequired = False
@@ -60,7 +59,8 @@ class SMB1:
         self._auth = None
 
         if session is None:
-            self._session = nmb.NetBIOSTCPSession(my_name, remote_name, remote_host, nmb.TYPE_SERVER, sess_port, self.__timeout)
+            self._session = nmb.NetBIOSTCPSession(my_name, remote_name, remote_host, nmb.TYPE_SERVER, sess_port,
+                                                  self.__timeout)
 
         self._negotiateResponse = self._negotiateSession(negSessionResponse)
 
@@ -76,9 +76,9 @@ class SMB1:
 
     def receive(self):
         r = self._session.recv_packet(self.__timeout)
-        return NewSMBPacket(data = r.get_trailer())
+        return NewSMBPacket(data=r.get_trailer())
 
-    def _negotiateSession(self, negPacket = None):
+    def _negotiateSession(self, negPacket=None):
         def parsePacket(negoPacket):
             if negoPacket['Flags2'] & SMB.FLAGS2_UNICODE:
                 self.__flags2 |= SMB.FLAGS2_UNICODE
@@ -112,7 +112,7 @@ class SMB1:
             negoPacket = self.receive()
             return parsePacket(negoPacket)
 
-        return parsePacket(NewSMBPacket(data = negPacket))
+        return parsePacket(NewSMBPacket(data=negPacket))
 
     def _wrapper(self, sessionResponse):
         sessionResponse['SecurityMode'] = 0x0
@@ -123,8 +123,9 @@ class SMB1:
                 sessionResponse['SecurityMode'] |= SMB2_NEGOTIATE_SIGNING_REQUIRED
         sessionResponse['MaxReadSize'] = self._dialects_parameters['MaxBufferSize']
         sessionResponse['MaxWriteSize'] = self._dialects_parameters['MaxBufferSize']
-        sessionResponse['SystemTime'] = self._to_long_filetime(self._dialects_parameters['LowDateTime'], self._dialects_parameters['HighDateTime'])
-        sessionResponse['ServerStartTime'] = 0 # SMB1 has not boot time totally
+        sessionResponse['SystemTime'] = self._to_long_filetime(self._dialects_parameters['LowDateTime'],
+                                                               self._dialects_parameters['HighDateTime'])
+        sessionResponse['ServerStartTime'] = 0  # SMB1 has not boot time totally
         return sessionResponse
 
     def _to_long_filetime(self, dwLowDateTime, dwHighDateTime):
@@ -136,7 +137,7 @@ class SMB1:
 
 class SMB3:
     def __init__(self, remote_name, remote_host, my_name=None,
-                    sess_port=445, timeout=60, session=None, negSessionResponse=None):
+                 sess_port=445, timeout=60, session=None, negSessionResponse=None):
         self._NetBIOSSession = session
         self._sequenceWindow = 0
         self._sessionId = 0
@@ -144,7 +145,8 @@ class SMB3:
         self._auth = None
 
         if session is None:
-            self._NetBIOSSession = nmb.NetBIOSTCPSession(my_name, remote_name, remote_host, nmb.TYPE_SERVER, sess_port, timeout)
+            self._NetBIOSSession = nmb.NetBIOSTCPSession(my_name, remote_name, remote_host, nmb.TYPE_SERVER, sess_port,
+                                                         timeout)
         else:
             self._sequenceWindow += 1
 
@@ -170,7 +172,7 @@ class SMB3:
         packet = SMB2Packet(data.get_trailer())
         return packet
 
-    def _negotiateSession(self, negSessionResponse = None):
+    def _negotiateSession(self, negSessionResponse=None):
         currentDialect = SMB2_DIALECT_WILDCARD
         if negSessionResponse is not None:
             negotiateResponse = SMB2Negotiate_Response(negSessionResponse['Data'])
@@ -194,35 +196,14 @@ class SMB3:
 
         return negotiateResponse
 
-    def _createSessionSetupRequest(self, dialect):
-        sessionSetup = SMB2SessionSetup()
-        sessionSetup['Flags'] = 0
-
-        blob = SPNEGO_NegTokenInit()
-        blob['MechTypes'] = [TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
-
-        self._auth = ntlm.getNTLMSSPType1('', '', False)
-        blob['MechToken'] = self._auth.getData()
-
-        sessionSetup['SecurityBufferLength'] = len(blob)
-        sessionSetup['Buffer']               = blob.getData()
-
-        packet = SMB2Packet()
-        if dialect >= SMB2_DIALECT_30:
-            packet = SMB3Packet()
-        packet['Command'] = SMB2_SESSION_SETUP
-        packet['Data']    = sessionSetup
-
-        return packet
-
 
 class SmbConnection:
     def __init__(self, ip, hostname, port) -> None:
-        self.target      = ip
-        self.hostname    = hostname
-        self._sess_port  = int(port)
-        self._timeout    = 60
-        self._myName     = self._get_my_name()
+        self.target = ip
+        self.hostname = hostname
+        self._sess_port = int(port)
+        self._timeout = 60
+        self._myName = self._get_my_name()
         self._nmbSession = None
         self._SMBConnection = None
 
@@ -238,10 +219,10 @@ class SmbConnection:
 
         if packet[0:1] == b'\xfe':
             self._SMBConnection = SMB3(self.hostname, self.target, self._myName, self._sess_port,
-                                        self._timeout, session=self._nmbSession, negSessionResponse=SMB2Packet(packet))
+                                       self._timeout, session=self._nmbSession, negSessionResponse=SMB2Packet(packet))
         else:
             self._SMBConnection = SMB1(self.hostname, self.target, self._myName, self._sess_port,
-                                        self._timeout, session=self._nmbSession, negSessionResponse=packet)
+                                       self._timeout, session=self._nmbSession, negSessionResponse=packet)
         return self._SMBConnection.GetNegotiateResponse()
 
     def GetChallange(self):
@@ -257,7 +238,8 @@ class SmbConnection:
         smbp['Flags2'] = flags2 | SMB.FLAGS2_UNICODE
         response = None
         while tries < 2:
-            self._nmbSession = nmb.NetBIOSTCPSession(self._myName, self.hostname, self.target, nmb.TYPE_SERVER, self._sess_port, self._timeout)
+            self._nmbSession = nmb.NetBIOSTCPSession(self._myName, self.hostname, self.target, nmb.TYPE_SERVER,
+                                                     self._sess_port, self._timeout)
             negSession = SMBCommand(SMB.SMB_COM_NEGOTIATE)
             if extended_security is True:
                 smbp['Flags2'] |= SMB.FLAGS2_EXTENDED_SECURITY
@@ -288,13 +270,14 @@ class SmbConnection:
 
 
 class NtlmInfo:
-    def __init__(self, ip, hostname, port) -> None:
-        self.target     = ip
-        self.hostname   = hostname
-        self._sess_port = int(port)
-        self._timeout   = 10
+    def __init__(self, ip, hostname) -> None:
+        self.target = ip
+        self.hostname = hostname
+        self._timeout = 10
+        self._connection = SmbConnection(self.target, self.hostname, 445)
+        self._negotiateResponse = self._connection.NegotiateSession()
+
 
     def get_server_time(self):
-        connection = SmbConnection(self.target, self.hostname, self._sess_port)
-        negotiateResponse = connection.NegotiateSession()
-        return 0 if negotiateResponse['SystemTime'] == 0 else utils.win_timestamp_to_datetime(negotiateResponse['SystemTime'])
+        return 0 if self._negotiateResponse['SystemTime'] == 0 else utils.win_timestamp_to_datetime(
+            self._negotiateResponse['SystemTime'])
