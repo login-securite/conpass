@@ -95,29 +95,18 @@ class ThreadPool:
         signal.signal(signal.SIGTERM, self.interrupt_event)
 
     def run(self):
+        self.get_smb_information()
+        self.start_threads()
+        self.start_password_spray()
+
+    def get_smb_information(self):
         self.__console.rule('Gathering info')
         if self.__dc_ip is None:
             self.__dc_host, self.__dc_ip = Session.get_dc_details(self.__domain)
         self.__time_delta = Session.get_time_delta(self.__dc_ip, self.__dc_host)
         self.__console.print(f"Time difference with '{self.__dc_host}': {self.__time_delta.total_seconds()} seconds")
         if self.__username is not None:
-            try:
-                self.__ldap_connection = LdapConnection(
-                    dc_ip=self.__dc_ip,
-                    base_dn=self.__base_dn,
-                    domain=self.__domain,
-                    username=self.__username,
-                    password=self.__password,
-                    page_size=200,
-                    console=self.__console
-                )
-            except Exception as e:
-                self.__console.error(f"Error in LDAP: {str(e)}")
-                raise e
-            if not self.__ldap_connection.login():
-                self.__console.print(f"[red]LDAP bind failed[/red]")
-                exit()
-
+            self.ldap_init()
             self.__console.print(f"Successfully connected to '{self.__dc_host}' via LDAP")
 
             self.__console.rule('Default Domain Policy')
@@ -136,16 +125,19 @@ class ThreadPool:
                 self.__console.print(f'[yellow]Can NOT read PSO details')
 
             self.__console.rule('Active Users')
-            res = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta, self.__security_threshold)
+            res = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta,
+                                                          self.__security_threshold)
             self.__users = res['users']
             statistics = res['stats']
             self.__console.print(f"Total users: {statistics['total_users']}")
             self.__console.print(f"Users without PSO: {len([user for user in self.__users if user.pso is None])}")
             for pso, total in statistics['pso'].items():
-                self.__console.print(f"[blue]{pso}[/blue]: {total} user{' ([red]Details can NOT be read[/red])' if not self.__ldap_connection.can_read_pso() else ''}")
+                self.__console.print(
+                    f"[blue]{pso}[/blue]: {total} user{' ([red]Details can NOT be read[/red])' if not self.__ldap_connection.can_read_pso() else ''}")
             self.__console.print(f"Total sprayed users: {len(self.__users)}")
         else:
-            self.__console.print("[yellow]Building users list based on provided password policy. No online checks will be made.[/yellow]")
+            self.__console.print(
+                "[yellow]Building users list based on provided password policy. No online checks will be made.[/yellow]")
             # No user provided so users list is constructed based on information given in parameters
             with open(self.__user_file, 'r') as f:
                 for username in f:
@@ -159,6 +151,25 @@ class ThreadPool:
                         None)
                     )
 
+    def ldap_init(self):
+        try:
+            self.__ldap_connection = LdapConnection(
+                dc_ip=self.__dc_ip,
+                base_dn=self.__base_dn,
+                domain=self.__domain,
+                username=self.__username,
+                password=self.__password,
+                page_size=200,
+                console=self.__console
+            )
+        except Exception as e:
+            self.__console.error(f"Error in LDAP: {str(e)}")
+            raise e
+        if not self.__ldap_connection.login():
+            self.__console.print(f"[red]LDAP bind failed[/red]")
+            exit()
+
+    def start_threads(self):
         for i in range(self.__max_threads):
             thread = Worker(
                 self.__users,
@@ -185,6 +196,7 @@ class ThreadPool:
             self.__all_threads.append(thread)
             thread.start()
 
+    def start_password_spray(self):
         self.__console.rule('Password Sraying')
         with Progress(console=self.__console) as progress:
             progress_task = progress.add_task("Spraying passwords", total=0)
@@ -209,9 +221,6 @@ class ThreadPool:
                     self.__console.print(f"[red]Password file can not be found. Quitting.[/red]")
                     break
                 time.sleep(1)
-    def __preflight_checks(self):
-        self.__console.rule('Preflight checks')
-
 
     def interrupt_event(self, signum, stack):
         self.__console.print(f"[red]** Interrupted! **[/red]")
