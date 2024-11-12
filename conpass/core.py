@@ -59,6 +59,7 @@ class ThreadPool:
             security_threshold,
             max_threads,
             limit_memory,
+            disable_spray,
             console
     ):
         self.__username = username
@@ -79,6 +80,7 @@ class ThreadPool:
         self.__security_threshold = security_threshold
         self.__max_threads = max_threads
         self.__limit_memory = limit_memory
+        self.__disable_spray = disable_spray
         self.__console = console
         self.__ldap_connection = None
         self.__all_threads = []
@@ -96,6 +98,8 @@ class ThreadPool:
 
     def run(self):
         self.get_smb_information()
+        if self.__disable_spray:
+            return True
         self.start_threads()
         self.start_password_spray()
 

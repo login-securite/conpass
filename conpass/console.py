@@ -127,6 +127,14 @@ def spray(
             rich_help_panel="Spray",
         ),
     ] = False,
+    disable_spray: Annotated[
+        bool | None,
+        typer.Option(
+            "--disable-spray",
+            help="Disable password spraying. Useful to only retrieve PSO details",
+            rich_help_panel="Spray",
+        ),
+    ] = False,
     dc_ip: Annotated[
         str | None,
         typer.Option("--dc-ip", "-D", help="Primary domain controller IP address", rich_help_panel="Authentication"),
@@ -200,6 +208,7 @@ def spray(
             security_threshold,
             max_threads,
             limit_memory,
+            disable_spray,
             console
         )
         thread_pool.run()
