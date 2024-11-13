@@ -15,10 +15,10 @@ class User:
         self.time_delta = time_delta
         self.security_threshold = security_threshold
 
-        # Is this user already in the queue
+        # Is this user already in the testing queue
         self.__cp_lock = False
 
-    def can_be_tested(self, password):
+    def can_be_tested(self, password, ldap_connection, console):
         # Password already found
         if self.password:
             return False
@@ -31,12 +31,35 @@ class User:
         if self.is_locked():
             return False
 
+        # TODO try and implement this properly
+        #if not self.update(ldap_connection, console):
+        #    return False
+
         # Lockout risk
         if not self.check_lockout():
             return False
 
         self.tested_passwords.append(password)
         return True
+
+    def update(self, ldap_connection, console):
+        bad_password_count, bad_password_time = ldap_connection.get_user_password_status(self.samaccountname)
+        if bad_password_count != self.bad_password_count:
+            update_text = f"{self.samaccountname} 'badPwdCount' changed from {self.bad_password_count} to {bad_password_count}"
+
+            if self.bad_password_time > bad_password_time + timedelta(seconds=5) and len(self.tested_passwords) > 0:
+                console.log(f"{update_text} - User's password may be {self.tested_passwords[-1]}{'or ' + self.tested_passwords[-2] if len(self.tested_passwords) > 1 else ''}")
+            else:
+                if self.bad_password_count > bad_password_count:
+                    console.log(f"{update_text} - The user may have logged in")
+                else:
+                    console.log(f"{update_text} - The user may have entered a bad password")
+            console.log(f"{self.bad_password_time} to {bad_password_time}")
+            self.bad_password_count = bad_password_count
+
+        self.bad_password_time = bad_password_time
+        return True
+
 
     def is_locked(self):
         return self.__cp_lock

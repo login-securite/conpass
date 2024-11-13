@@ -83,6 +83,36 @@ class LdapConnection:
     def can_read_pso(self):
         return self.__can_read_psos
 
+    def get_user_password_status(self, samaccountname):
+        search_base = self.__base_dn
+        search_filter = f"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={samaccountname}))"
+        attributes = [
+            'samAccountName',
+            'badPwdCount',
+            'badPasswordTime'
+        ]
+        page_size = 100
+        cookie = None
+        entries = []
+        try:
+            while True:
+                self.__conn.search(
+                    search_base,
+                    search_filter,
+                    attributes=attributes,
+                    paged_size=page_size,
+                    paged_cookie=cookie
+                )
+                entries.extend(self.__conn.entries)
+                cookie = self.__conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                if not cookie:
+                    break
+        except Exception as e:
+            self.__console.print(f"[red]An error occurred while retrieving {samaccountname}: {str(e)}[/red]")
+            raise
+
+        return entries[0].badPwdCount.value, entries[0].badPasswordTime.value
+
     def get_active_users(self, psos, domain_policy, time_delta, security_threshold):
         search_base = self.__base_dn
         search_filter = "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(sAMAccountName=*$)))"
