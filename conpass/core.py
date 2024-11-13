@@ -2,7 +2,7 @@ import signal
 import threading
 import time
 
-from rich.progress import Progress
+from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn, TaskProgressColumn
 
 from conpass.ldapconnection import LdapConnection
 from conpass.session import Session
@@ -31,14 +31,13 @@ class Worker(threading.Thread):
             for password in self.__passwords:
                 for user in self.__users:
                     with lock:
-                        if not user.can_be_tested(password):
+                        if not user.can_be_tested(password, self.__ldap_connection, self.__console):
                             continue
                         user.lock()
-
-                    #self.__console.print(f"{self.__tid} Trying {user.samaccountname} - {password}")
                     if user.test_password(password, self.__smb_connection):
                         self.__console.print(f"Found: [yellow]{user.samaccountname} - {password}[/yellow]")
                     user.unlock()
+            time.sleep(0.1)
 
 class ThreadPool:
     def __init__(
@@ -202,7 +201,11 @@ class ThreadPool:
 
     def start_password_spray(self):
         self.__console.rule('Password Sraying')
-        with Progress(console=self.__console) as progress:
+        with Progress("[progress.description]{task.description}",
+                      BarColumn(),
+                      MofNCompleteColumn(),
+                      TaskProgressColumn(),
+                      console=self.__console) as progress:
             progress_task = progress.add_task("Spraying passwords", total=0)
             while True:
                 try:
@@ -217,9 +220,9 @@ class ThreadPool:
                             if password not in self.__passwords:
                                 self.__passwords.append(password)
                                 progress.update(progress_task, total=progress.tasks[progress_task].total + len(self.__users))
-                            completed += len([user for user in self.__users if user.password is not None or password in user.tested_passwords])
+                            completed = sum([len(user.tested_passwords) for user in self.__users])
+                            progress.update(progress_task, completed=completed)
 
-                    progress.update(progress_task, completed=completed)
 
                 except FileNotFoundError:
                     self.__console.print(f"[red]Password file can not be found. Quitting.[/red]")
