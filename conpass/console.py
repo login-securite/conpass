@@ -197,7 +197,7 @@ def spray(
         nb_passwords = sum(bl.count("\n") for bl in blocks(f))
         if nb_passwords > 100:
             res = console.input(f"[yellow]The password file has {nb_passwords} passwords. It will take a very long time to try them all[/yellow]\nDo you want to continue? \\[y/N] ")
-            if not res.startswith('y') and not res.startswith('Y'):
+            if not res.lower().startswith('y'):
                 raise typer.Exit(code=1)
 
     try:
