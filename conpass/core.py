@@ -3,7 +3,12 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn, TaskProgressColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TaskProgressColumn,
+)
 from rich.table import Table
 
 from conpass.ldapconnection import LdapConnection
@@ -200,10 +205,10 @@ class ThreadPool:
                 console=self.__console
             )
         except Exception as e:
-            self.__console.error(f"Error in LDAP: {str(e)}")
+            self.__console.error(f"Error in LDAP: {e!s}")
             raise e
         if not self.__ldap_connection.login():
-            self.__console.print(f"[red]LDAP bind failed[/red]")
+            self.__console.print("[red]LDAP bind failed[/red]")
             exit()
 
     def start_threads(self):
@@ -262,7 +267,7 @@ class ThreadPool:
 
 
                 except FileNotFoundError:
-                    self.__console.print(f"[red]Password file can not be found. Quitting.[/red]")
+                    self.__console.print("[red]Password file can not be found. Quitting.[/red]")
                     break
                 time.sleep(1)
 
@@ -270,7 +275,7 @@ class ThreadPool:
         users = []
         if self.__user_file is None:
             return users
-        with open(self.__user_file, 'r') as f:
+        with open(self.__user_file) as f:
             for username in f:
                 username = username.strip()
                 if username.isspace() or username == '':
@@ -279,5 +284,5 @@ class ThreadPool:
         return users
 
     def interrupt_event(self, signum, stack):
-        self.__console.print(f"[red]** Interrupted! **[/red]")
+        self.__console.print("[red]** Interrupted! **[/red]")
         exit()

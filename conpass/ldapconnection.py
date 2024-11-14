@@ -1,4 +1,4 @@
-from ldap3 import Server, Connection, ALL, NTLM
+from ldap3 import ALL, NTLM, Connection, Server
 
 from conpass.passwordpolicy import PasswordPolicy
 from conpass.user import User
@@ -43,7 +43,7 @@ class LdapConnection:
         try:
             self.__conn.search(search_base, search_filter, attributes=attributes)
         except Exception as e:
-            self.__console.print(f"[red]An error occurred while retrieving default domain policy: {str(e)}[/red]")
+            self.__console.print(f"[red]An error occurred while retrieving default domain policy: {e!s}[/red]")
             self.__console.print_exception()
             raise
         entry = self.__conn.entries[0]
@@ -66,12 +66,12 @@ class LdapConnection:
             if not self.__conn.search(pso_base_dn, pso_filter, attributes=pso_attributes):
                 return False
         except Exception as e:
-            self.__console.error(f"[red]An error occurred while retrieving PSO details: {str(e)}[/red]")
+            self.__console.error(f"[red]An error occurred while retrieving PSO details: {e!s}[/red]")
             return False
         self.__can_read_psos = True
 
         if len(self.__conn.entries) == 0:
-            self.__console.print(f"No PSO found")
+            self.__console.print("No PSO found")
         return [
             PasswordPolicy(
                 name=entry.name.value if entry.name else None,
@@ -109,7 +109,7 @@ class LdapConnection:
                 if not cookie:
                     break
         except Exception as e:
-            self.__console.print(f"[red]An error occurred while retrieving {samaccountname}: {str(e)}[/red]")
+            self.__console.print(f"[red]An error occurred while retrieving {samaccountname}: {e!s}[/red]")
             raise
 
         return entries[0].badPwdCount.value, entries[0].badPasswordTime.value
@@ -141,7 +141,7 @@ class LdapConnection:
                 if not cookie:
                     break
         except Exception as e:
-            self.__console.print(f"[red]An error occurred while retrieving active users: {str(e)}[/red]")
+            self.__console.print(f"[red]An error occurred while retrieving active users: {e!s}[/red]")
             raise
 
         users = []

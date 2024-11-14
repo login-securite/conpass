@@ -1,4 +1,5 @@
-from datetime import timedelta, datetime, timezone
+from datetime import datetime, timedelta, timezone
+
 from conpass.session import Session
 
 

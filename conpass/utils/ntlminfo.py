@@ -36,9 +36,17 @@ import string
 from impacket import nmb
 from impacket.dcerpc.v5.rpcrt import *
 from impacket.nt_errors import STATUS_SUCCESS
-from impacket.smb import SMB, NewSMBPacket, SMBCommand, SMBNTLMDialect_Parameters, \
-    SMBNTLMDialect_Data, SMBExtended_Security_Parameters, SMBExtended_Security_Data, UnsupportedFeature, \
-    SMB_DIALECT
+from impacket.smb import (
+    SMB,
+    SMB_DIALECT,
+    NewSMBPacket,
+    SMBCommand,
+    SMBExtended_Security_Data,
+    SMBExtended_Security_Parameters,
+    SMBNTLMDialect_Data,
+    SMBNTLMDialect_Parameters,
+    UnsupportedFeature,
+)
 from impacket.smb3structs import *
 
 from conpass import utils
@@ -94,9 +102,8 @@ class SMB1:
                     self._dialects_data = SMBExtended_Security_Data(sessionResponse['Data'])
                     if self._dialects_parameters['SecurityMode'] & SMB.SECURITY_SIGNATURES_REQUIRED:
                         self._SignatureRequired = True
-                else:
-                    if self._dialects_parameters['DialectIndex'] == 0xffff:
-                        raise UnsupportedFeature("Remote server does not know NT LM 0.12")
+                elif self._dialects_parameters['DialectIndex'] == 0xffff:
+                    raise UnsupportedFeature("Remote server does not know NT LM 0.12")
 
                 return self._wrapper(sessionResponse)
 

@@ -3,7 +3,6 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
-from rich.theme import Theme
 
 from conpass.core import ThreadPool
 from conpass.utils import blocks
@@ -177,7 +176,7 @@ def spray(
         logger.error("Either --username or --users-file is required")
         raise typer.Exit(code=1)
     if '.' not in domain:
-        logger.error(f"Provide fully qualified domain name (e.g. domain.local instead of DOMAIN)")
+        logger.error("Provide fully qualified domain name (e.g. domain.local instead of DOMAIN)")
         raise typer.Exit(code=1)
 
     if username is not None and password is None and hashes is None and (use_kerberos is False or aes_key is None):
@@ -192,10 +191,10 @@ def spray(
         logger.error("When using --users-file, --lockout-threshold and --lockout-observation-window are required")
         raise typer.Exit(code=1)
 
-    with open(password_file, "r") as f:
+    with open(password_file) as f:
         nb_passwords = sum(bl.count("\n") for bl in blocks(f))
         if nb_passwords > 100:
-            res = console.input(f"[yellow]The password file has {nb_passwords} passwords. It will take a very long time to try them all[/yellow]\nDo you want to continue? \[y/N] ")
+            res = console.input(f"[yellow]The password file has {nb_passwords} passwords. It will take a very long time to try them all[/yellow]\nDo you want to continue? \\[y/N] ")
             if not res.startswith('y') and not res.startswith('Y'):
                 raise typer.Exit(code=1)
 

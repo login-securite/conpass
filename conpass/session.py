@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
+
 from impacket.smbconnection import SMBConnection
+
 from conpass.utils.ntlminfo import NtlmInfo
 
 
@@ -27,7 +29,7 @@ class Session:
             self.smb_session = SMBConnection(self.address, self.target_ip)
             self.ttl = 3
         except Exception as e:
-            self.console.print(f"Couldn't open SMB session: {str(e)}")
+            self.console.print(f"Couldn't open SMB session: {e!s}")
             self.smb_session = None
             return False
         return self
@@ -39,7 +41,7 @@ class Session:
         except Exception as e:
             if 'Broken pipe' in str(e) or 'Connection reset by peer' in str(e) or 'Error occurs while reading from remote' in str(e):
                 if self.ttl == 0:
-                    self.console.print(f"SMB Broken pipe. Quitting.")
+                    self.console.print("SMB Broken pipe. Quitting.")
                     return Session.STATUS.SMB_CLOSED
                 self.ttl -= 1
                 import time
