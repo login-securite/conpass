@@ -139,10 +139,11 @@ class ThreadPool:
 
             self.__console.rule('Active Users')
             res = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta,
-                                                          self.__security_threshold)
+                                                          self.__security_threshold, self.get_users_from_file())
             self.__users = res['users']
             statistics = res['stats']
-            self.__console.print(f"Total users: {statistics['total_users']}")
+            if len(self.get_users_from_file()) == 0:
+                self.__console.print(f"Total users: {statistics['total_users']}")
             self.__console.print(f"Users without PSO: {len([user for user in self.__users if user.pso is None])}")
             for pso, total in statistics['pso'].items():
                 self.__console.print(
@@ -159,23 +160,19 @@ class ThreadPool:
             self.__console.print(f'Lockout Window: {self.__lockout_observation_window} seconds')
 
             # No user provided so users list is constructed based on information given in parameters
-            with open(self.__user_file, 'r') as f:
-                for username in f:
-                    username = username.strip()
-                    if username.isspace() or username == '':
-                        continue
-                    self.__users.append(User(
-                        samaccountname=username,
-                        dn=None,
-                        bad_password_count=0,
-                        bad_password_time=datetime(1970, 1, 1).replace(tzinfo=timezone.utc),
-                        lockout_window=self.__lockout_observation_window,
-                        lockout_threshold=self.__lockout_threshold,
-                        pso=None,
-                        time_delta=self.__time_delta,
-                        security_threshold=self.__security_threshold,
-                        console=self.__console
-                    ))
+            for username in self.get_users_from_file():
+                self.__users.append(User(
+                    samaccountname=username,
+                    dn=None,
+                    bad_password_count=0,
+                    bad_password_time=datetime(1970, 1, 1).replace(tzinfo=timezone.utc),
+                    lockout_window=self.__lockout_observation_window,
+                    lockout_threshold=self.__lockout_threshold,
+                    pso=None,
+                    time_delta=self.__time_delta,
+                    security_threshold=self.__security_threshold,
+                    console=self.__console
+                ))
             self.__console.rule('Manual Users')
             self.__console.print(f"Total sprayed users: {len(self.__users)}")
 
@@ -256,6 +253,18 @@ class ThreadPool:
                     self.__console.print(f"[red]Password file can not be found. Quitting.[/red]")
                     break
                 time.sleep(1)
+
+    def get_users_from_file(self):
+        users = []
+        if self.__user_file is None:
+            return users
+        with open(self.__user_file, 'r') as f:
+            for username in f:
+                username = username.strip()
+                if username.isspace() or username == '':
+                    continue
+                users.append(username)
+        return users
 
     def interrupt_event(self, signum, stack):
         self.__console.print(f"[red]** Interrupted! **[/red]")

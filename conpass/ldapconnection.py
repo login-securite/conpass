@@ -113,7 +113,7 @@ class LdapConnection:
 
         return entries[0].badPwdCount.value, entries[0].badPasswordTime.value
 
-    def get_active_users(self, psos, domain_policy, time_delta, security_threshold):
+    def get_active_users(self, psos, domain_policy, time_delta, security_threshold, file_users):
         search_base = self.__base_dn
         search_filter = "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(sAMAccountName=*$)))"
         attributes = [
@@ -148,6 +148,10 @@ class LdapConnection:
                       'pso': {}}
         for entry in entries:
             if entry.samAccountName.value == self.__username:
+                continue
+
+            # User file provided, discard all users not in that list
+            if len(file_users) > 0 and entry.samAccountName.value not in file_users:
                 continue
             if entry['msDS-ResultantPSO']:
                 pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]

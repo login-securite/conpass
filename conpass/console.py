@@ -187,7 +187,7 @@ def spray(
         logger.error("Only one secret can be provided")
         raise typer.Exit(code=1)
 
-    if user_file and (not lockout_threshold or not lockout_observation_window):
+    if username is None and user_file and (not lockout_threshold or not lockout_observation_window):
         logger.error("When using --users-file, --lockout-threshold and --lockout-observation-window are required")
         raise typer.Exit(code=1)
 
