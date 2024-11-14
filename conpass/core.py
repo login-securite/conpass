@@ -130,7 +130,7 @@ class ThreadPool:
         if self.__username is not None:
             # Online version
             self.ldap_init()
-            self.__console.print(f"Successfully connected to '{self.__dc_host}' via LDAP")
+            self.__console.print(f"Successfully connected to '{self.__dc_host}' ({self.__dc_ip}) via LDAP")
 
             self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
             self.__psos = self.__ldap_connection.get_psos_details()
