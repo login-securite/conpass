@@ -4,11 +4,11 @@ from conpass.utils.ntlminfo import NtlmInfo
 
 
 class Session:
-    def __init__(self, address, target_ip, domain, logger):
+    def __init__(self, address, target_ip, domain, console):
         self.address = address
         self.target_ip = target_ip
         self.domain = domain
-        self.logger = logger
+        self.console = console
 
         self.ttl = 3
 
@@ -19,29 +19,34 @@ class Session:
             self.smb_session = SMBConnection(self.address, self.target_ip)
             self.ttl = 3
         except Exception as e:
-            self.logger.error(f"Couldn't open SMB session: {str(e)}")
+            self.console.print(f"Couldn't open SMB session: {str(e)}")
             self.smb_session = None
             return False
         return self
 
-    def test_credentials(self, username, password):
+    def test_credentials(self, username, password, locked_out_users):
         try:
             self.smb_session.login(user=username, password=password, domain=self.domain)
-            return True
+            return 0
         except Exception as e:
             if 'Broken pipe' in str(e):
                 if self.ttl == 0:
-                    self.logger.debug(f"SMB Broken pipe. Quitting.")
+                    self.console.print(f"SMB Broken pipe. Quitting.")
                     return False
                 self.ttl -= 1
                 import time
                 time.sleep(0.5)
                 #self.logger.debug(f"SMB Broken pipe. Reconnecting... ({3-self.ttl}/3)")
                 self.get_session()
-                self.test_credentials(username, password)
+                self.test_credentials(username, password, locked_out_users)
             if 'STATUS_ACCOUNT_LOCKED_OUT' in str(e):
-                self.logger.error(f"DANGER: {username} LOCKED OUT (Unlock-ADAccount -Identity {username})")
-            return False
+                self.console.print(f"[red]DANGER: {username} LOCKED OUT - ABORTING (Unlock-ADAccount -Identity {username})[/red]")
+                locked_out_users.append(username)
+            if 'STATUS_PASSWORD_EXPIRED' in str(e):
+                return 1
+            if 'STATUS_ACCOUNT_EXPIRED' in str(e):
+                return 2
+            return -1
 
     @staticmethod
     def get_dc_details(domain):

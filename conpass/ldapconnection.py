@@ -147,6 +147,8 @@ class LdapConnection:
         statistics = {'total_users': len(entries),
                       'pso': {}}
         for entry in entries:
+            if entry.samAccountName.value == self.__username:
+                continue
             if entry['msDS-ResultantPSO']:
                 pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
                 if pso_name not in statistics['pso']:
@@ -181,7 +183,8 @@ class LdapConnection:
                 lockout_threshold=lockout_threshold,
                 pso=pso,
                 time_delta=time_delta,
-                security_threshold=security_threshold
+                security_threshold=security_threshold,
+                console=self.__console
             )
 
             users.append(user)
