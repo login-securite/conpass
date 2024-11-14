@@ -32,6 +32,13 @@ ignore = [
   "ISC001",     # Conflicts with formatter
   "E501",       # Line too long
   "Q000",       # Double quotes checking
+  "FBT002",
+  "BLE001",
+  "PLR0913",
+  "TCH003",
+  "PTH123",
+  "PLR1722",
+
 
   "ANN",        # Annotations
   "D",          # Docstrings

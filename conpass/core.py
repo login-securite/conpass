@@ -159,7 +159,7 @@ class ThreadPool:
                         pso.name,
                         str(pso.lockout_threshold),
                         str(pso.lockout_window),
-                        str(statistics['pso'][pso.name] if pso.name in statistics['pso'] else 0)
+                        str(statistics['pso'].get(pso.name, 0))
                     )
             self.__console.print(password_policies_table)
         else:
@@ -182,7 +182,7 @@ class ThreadPool:
                     samaccountname=username,
                     dn=None,
                     bad_password_count=0,
-                    bad_password_time=datetime(1970, 1, 1).replace(tzinfo=timezone.utc),
+                    bad_password_time=datetime(1970, 1, 1, tzinfo=timezone.utc),
                     lockout_window=self.__lockout_observation_window,
                     lockout_threshold=self.__lockout_threshold,
                     pso=None,
