@@ -1,4 +1,5 @@
 from datetime import timedelta, datetime, timezone
+from conpass.session import Session
 
 
 class User:
@@ -42,17 +43,17 @@ class User:
             if not self.check_lockout(online):
                 return False
 
-        self.tested_passwords.append(password)
         return True
 
     def update(self, ldap_connection):
         bad_password_count, bad_password_time = ldap_connection.get_user_password_status(self.samaccountname)
         if bad_password_count != self.bad_password_count:
-            update_text = f"'badPwdCount' changed from {self.bad_password_count} to {bad_password_count}"
             if self.bad_password_time > bad_password_time and self.bad_password_count > bad_password_count and len(self.tested_passwords) > 0:
-                self.console.print(f"       [yellow]{self.samaccountname}[/yellow] N-1 password may be [yellow]{self.tested_passwords[-1]}[/yellow] ({update_text})")
-            #else:
-            #    self.console.print(f"       [yellow]{self.samaccountname}[/yellow] ({update_text})")
+                self.console.print(f"[yellow]{self.samaccountname}[/yellow] may have [yellow]{self.tested_passwords[-1]}[/yellow] in his password history")
+            """
+            else:
+                self.console.print(f"[yellow]{self.samaccountname}[/yellow] ({update_text})")
+            """
             self.bad_password_count = bad_password_count
 
         self.bad_password_time = bad_password_time
@@ -79,17 +80,16 @@ class User:
     def test_password(self, password, smb_connection, locked_out_users):
         self.bad_password_time = datetime.now(timezone.utc) - self.time_delta
         res = smb_connection.test_credentials(self.samaccountname, password, locked_out_users)
-        if res < 0:
-            self.bad_password_count += 1
-            if res == -2:
-                # Couldn't try this password as SMB session was closed
-                self.tested_passwords.pop()
+        if res == Session.STATUS.SMB_CLOSED:
             return False
-        elif res == 1:
+        self.tested_passwords.append(password)
+        if res in (Session.STATUS.INVALID_PASSWORD, Session.STATUS.ACCOUNT_LOCKOUT):
+            self.bad_password_count += 1
+            return False
+        elif res == Session.STATUS.PASSWORD_EXPIRED:
             self.password_expired = True
-        elif res == 2:
+        elif res == Session.STATUS.ACCOUNT_EXPIRED:
             self.account_expired = True
-
         self.password = password
         self.bad_password_count = 0
         return True

@@ -44,6 +44,7 @@ class LdapConnection:
             self.__conn.search(search_base, search_filter, attributes=attributes)
         except Exception as e:
             self.__console.print(f"[red]An error occurred while retrieving default domain policy: {str(e)}[/red]")
+            self.__console.print_exception()
             raise
         entry = self.__conn.entries[0]
         return PasswordPolicy(

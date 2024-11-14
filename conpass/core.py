@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn, TaskProgressColumn
+from rich.table import Table
 
 from conpass.ldapconnection import LdapConnection
 from conpass.session import Session
@@ -45,10 +46,11 @@ class Worker(threading.Thread):
                             ext = ' (Password expired)'
                         elif user.account_expired:
                             ext = ' (Account expired)'
-                        self.__console.print(f"Found: [yellow]{user.samaccountname} - {password}[/yellow]{ext}")
+                        self.__console.print(f"[yellow]{user.samaccountname} - {password}[/yellow][bright_black]{ext}[/bright_black]")
                     user.unlock()
                     time.sleep(0.5)
             time.sleep(0.1)
+
 
 class ThreadPool:
     def __init__(
@@ -104,6 +106,9 @@ class ThreadPool:
         signal.signal(signal.SIGTERM, self.interrupt_event)
 
     def run(self):
+        self.__console.rule('Important information')
+        self.__console.print("[yellow]This tool does its best to find the effective password policy but may be wrong. Use with caution.[/yellow]")
+        self.__console.print("[yellow]Emergency command:[/yellow] [red]Search-ADAccount -LockedOut | Unlock-ADAccount[/red]")
         self.get_required_informations()
         if self.__disable_spray:
             return True
@@ -117,47 +122,54 @@ class ThreadPool:
         self.__time_delta = Session.get_time_delta(self.__dc_ip, self.__dc_host)
         self.__console.print(f"Time difference with '{self.__dc_host}': {self.__time_delta.total_seconds()} seconds")
 
+        password_policies_table = Table()
+        password_policies_table.add_column('Name')
+        password_policies_table.add_column('Lockout Threshold')
+        password_policies_table.add_column('Lockout Window (s)')
+
         if self.__username is not None:
             # Online version
             self.ldap_init()
             self.__console.print(f"Successfully connected to '{self.__dc_host}' via LDAP")
 
-            self.__console.rule('Default Domain Policy')
             self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
-            self.__console.print(f'Lockout Threshold: {self.__default_domain_policy.lockout_threshold}')
-            self.__console.print(f'Lockout Window: {self.__default_domain_policy.lockout_window} seconds')
-
-            self.__console.rule('Password Security Objects')
             self.__psos = self.__ldap_connection.get_psos_details()
-            if self.__ldap_connection.can_read_pso():
-                for pso in self.__psos:
-                    self.__console.print(f'[blue]{pso.name}[/blue]')
-                    self.__console.print(f'Lockout Threshold: {pso.lockout_threshold}')
-                    self.__console.print(f'Lockout Window: {pso.lockout_window}')
-            else:
-                self.__console.print(f'[yellow]Can NOT read PSO details')
-
-            self.__console.rule('Active Users')
             res = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta,
                                                           self.__security_threshold, self.get_users_from_file())
             self.__users = res['users']
             statistics = res['stats']
-            if len(self.get_users_from_file()) == 0:
-                self.__console.print(f"Total users: {statistics['total_users']}")
-            self.__console.print(f"Users without PSO: {len([user for user in self.__users if user.pso is None])}")
-            for pso, total in statistics['pso'].items():
-                self.__console.print(
-                    f"[blue]{pso}[/blue]: {total} user{' ([red]Details can NOT be read[/red])' if not self.__ldap_connection.can_read_pso() else ''}")
-            self.__console.print(f"Total sprayed users: {len(self.__users)}")
+
+            self.__console.rule('Password Policies')
+            password_policies_table.add_column('Nb of users')
+            password_policies_table.add_row(
+                "Default Domain Policy",
+                str(self.__default_domain_policy.lockout_threshold),
+                str(self.__default_domain_policy.lockout_window),
+                str(len([user for user in self.__users if user.pso is None]))
+            )
+
+            if self.__ldap_connection.can_read_pso():
+                for pso in self.__psos:
+                    password_policies_table.add_row(
+                        pso.name,
+                        str(pso.lockout_threshold),
+                        str(pso.lockout_window),
+                        str(statistics['pso'][pso.name] if pso.name in statistics['pso'] else 0)
+                    )
+            self.__console.print(password_policies_table)
         else:
             self.__online = False
             # Offline version
             self.__console.print(
                 "[yellow]Building users list based on provided password policy. No online checks will be made.[/yellow]")
 
-            self.__console.rule('Manual Domain Policy')
-            self.__console.print(f'Lockout Threshold: {self.__lockout_threshold}')
-            self.__console.print(f'Lockout Window: {self.__lockout_observation_window} seconds')
+            password_policies_table.add_row(
+                "Manual Domain Policy",
+                str(self.__lockout_threshold),
+                str(self.__lockout_observation_window),
+            )
+
+            self.__console.print(password_policies_table)
 
             # No user provided so users list is constructed based on information given in parameters
             for username in self.get_users_from_file():

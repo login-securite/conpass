@@ -3,6 +3,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.theme import Theme
 
 from conpass.core import ThreadPool
 from conpass.utils import blocks
@@ -219,4 +220,5 @@ def spray(
         thread_pool.run()
     except Exception as e:
         logger.critical(e)
+        console.print_exception()
         raise typer.Exit(code=1) from None

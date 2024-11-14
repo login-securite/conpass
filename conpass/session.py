@@ -4,6 +4,14 @@ from conpass.utils.ntlminfo import NtlmInfo
 
 
 class Session:
+    class STATUS:
+        PASSWORD_SUCCESS = 0x01
+        PASSWORD_EXPIRED = 0x02
+        ACCOUNT_EXPIRED = 0x04
+        INVALID_PASSWORD = 0x08
+        SMB_CLOSED = 0x10
+        ACCOUNT_LOCKOUT = 0x20
+
     def __init__(self, address, target_ip, domain, console):
         self.address = address
         self.target_ip = target_ip
@@ -27,26 +35,32 @@ class Session:
     def test_credentials(self, username, password, locked_out_users):
         try:
             self.smb_session.login(user=username, password=password, domain=self.domain)
-            return 0
+            return Session.STATUS.PASSWORD_SUCCESS
         except Exception as e:
-            if 'Broken pipe' in str(e) or 'Connection reset by peer' in str(e):
+            if 'Broken pipe' in str(e) or 'Connection reset by peer' in str(e) or 'Error occurs while reading from remote' in str(e):
                 if self.ttl == 0:
                     self.console.print(f"SMB Broken pipe. Quitting.")
-                    return -2
+                    return Session.STATUS.SMB_CLOSED
                 self.ttl -= 1
                 import time
                 time.sleep(0.5)
                 #self.console.print(f"SMB Broken pipe. Reconnecting... ({3-self.ttl}/3)")
                 self.get_session()
                 return self.test_credentials(username, password, locked_out_users)
-            if 'STATUS_ACCOUNT_LOCKED_OUT' in str(e):
+            elif 'STATUS_ACCOUNT_LOCKED_OUT' in str(e):
                 self.console.print(f"[red]DANGER: {username} LOCKED OUT - ABORTING (Unlock-ADAccount -Identity {username})[/red]")
                 locked_out_users.append(username)
-            if 'STATUS_PASSWORD_EXPIRED' in str(e):
-                return 1
-            if 'STATUS_ACCOUNT_EXPIRED' in str(e):
-                return 2
-            return -1
+                return Session.STATUS.ACCOUNT_LOCKOUT
+            elif 'STATUS_PASSWORD_EXPIRED' in str(e):
+                return Session.STATUS.PASSWORD_EXPIRED
+            elif 'STATUS_ACCOUNT_EXPIRED' in str(e):
+                return Session.STATUS.ACCOUNT_EXPIRED
+            elif 'STATUS_LOGON_FAILURE' in str(e):
+                return Session.STATUS.INVALID_PASSWORD
+            else:
+                self.console.print(f"Unexpected error for {username}. Please create an issue containing this error: {e}")
+            return Session.STATUS.INVALID_PASSWORD
+
 
     @staticmethod
     def get_dc_details(domain):
