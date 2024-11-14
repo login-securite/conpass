@@ -49,9 +49,10 @@ class User:
         bad_password_count, bad_password_time = ldap_connection.get_user_password_status(self.samaccountname)
         if bad_password_count != self.bad_password_count:
             update_text = f"'badPwdCount' changed from {self.bad_password_count} to {bad_password_count}"
-
-            if self.bad_password_time > bad_password_time and len(self.tested_passwords) > 0:
-                self.console.log(f"[yellow]{self.samaccountname}[/yellow] old password may have been [yellow]{self.tested_passwords[-1]}[/yellow] ({update_text})")
+            if self.bad_password_time > bad_password_time and self.bad_password_count > bad_password_count and len(self.tested_passwords) > 0:
+                self.console.print(f"       [yellow]{self.samaccountname}[/yellow] N-1 password may be [yellow]{self.tested_passwords[-1]}[/yellow] ({update_text})")
+            #else:
+            #    self.console.print(f"       [yellow]{self.samaccountname}[/yellow] ({update_text})")
             self.bad_password_count = bad_password_count
 
         self.bad_password_time = bad_password_time
@@ -80,6 +81,9 @@ class User:
         res = smb_connection.test_credentials(self.samaccountname, password, locked_out_users)
         if res < 0:
             self.bad_password_count += 1
+            if res == -2:
+                # Couldn't try this password as SMB session was closed
+                self.tested_passwords.pop()
             return False
         elif res == 1:
             self.password_expired = True

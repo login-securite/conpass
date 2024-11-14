@@ -29,16 +29,16 @@ class Session:
             self.smb_session.login(user=username, password=password, domain=self.domain)
             return 0
         except Exception as e:
-            if 'Broken pipe' in str(e):
+            if 'Broken pipe' in str(e) or 'Connection reset by peer' in str(e):
                 if self.ttl == 0:
                     self.console.print(f"SMB Broken pipe. Quitting.")
-                    return False
+                    return -2
                 self.ttl -= 1
                 import time
                 time.sleep(0.5)
-                #self.logger.debug(f"SMB Broken pipe. Reconnecting... ({3-self.ttl}/3)")
+                #self.console.print(f"SMB Broken pipe. Reconnecting... ({3-self.ttl}/3)")
                 self.get_session()
-                self.test_credentials(username, password, locked_out_users)
+                return self.test_credentials(username, password, locked_out_users)
             if 'STATUS_ACCOUNT_LOCKED_OUT' in str(e):
                 self.console.print(f"[red]DANGER: {username} LOCKED OUT - ABORTING (Unlock-ADAccount -Identity {username})[/red]")
                 locked_out_users.append(username)
