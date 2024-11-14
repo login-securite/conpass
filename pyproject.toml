@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "conpass"
-version = "0.0.1"
+version = "0.2.0"
 description = "Continuous password spraying tool"
 authors = ["pixis <romain.bentz@login-securite.com>"]
 license = "MIT"
@@ -30,6 +30,8 @@ select = ["ALL"]
 ignore = [
   "COM812",     # Conflicts with formatter
   "ISC001",     # Conflicts with formatter
+  "E501",       # Line too long
+  "Q000",       # Double quotes checking
 
   "ANN",        # Annotations
   "D",          # Docstrings
