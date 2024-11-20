@@ -10,6 +10,7 @@ class User:
         self.password = None
         self.password_expired = False
         self.account_expired = False
+        self.account_restricted = False
         self.bad_password_time = bad_password_time
         self.bad_password_count = bad_password_count
         self.lockout_window = lockout_window
@@ -86,11 +87,20 @@ class User:
         self.tested_passwords.append(password)
         if res in (Session.STATUS.INVALID_PASSWORD, Session.STATUS.ACCOUNT_LOCKOUT):
             self.bad_password_count += 1
+            if res == Session.STATUS.ACCOUNT_LOCKOUT and self.bad_password_count < self.lockout_threshold:
+                self.console.print(
+                    f"[bright_black]Account appears locked out, likely due to synchronization issues between domain controllers. "
+                    f"On the queried DC, 'badPwdCount' is {self.bad_password_count}, which is below the lockout threshold of {self.lockout_threshold}. "
+                    f"This discrepancy suggests the account was locked on another DC where the threshold was reached. "
+                    f"Exiting anyway.[/bright_black]"
+                )
             return False
         elif res == Session.STATUS.PASSWORD_EXPIRED:
             self.password_expired = True
         elif res == Session.STATUS.ACCOUNT_EXPIRED:
             self.account_expired = True
+        elif res == Session.STATUS.ACCOUNT_RESTRICTION:
+            self.account_restricted = True
         self.password = password
         self.bad_password_count = 0
         return True
@@ -102,4 +112,20 @@ class User:
         return self.__repr__()
 
     def __repr__(self):
-        return f"User(samAccountName={self.samaccountname}, password={self.password}, bad_password_time={self.bad_password_time}, bad_password_count={self.bad_password_count}, lockout_window={self.lockout_window}, lockout_threshold={self.lockout_threshold}, pso={self.pso})"
+        return (
+            f"User Information:\n"
+            f"------------------\n"
+            f"SAM Account Name  : {self.samaccountname}\n"
+            f"Distinguished Name: {self.dn}\n"
+            f"Password           : {'Set' if self.password else 'Not Set'}\n"
+            f"Password Expired   : {'Yes' if self.password_expired else 'No'}\n"
+            f"Account Expired    : {'Yes' if self.account_expired else 'No'}\n"
+            f"Account Restricted : {'Yes' if self.account_restricted else 'No'}\n"
+            f"Bad Password Count : {self.bad_password_count}\n"
+            f"Bad Password Time  : {self.bad_password_time}\n"
+            f"Lockout Window     : {self.lockout_window if self.lockout_window else 'Not Configured'}\n"
+            f"Lockout Threshold  : {self.lockout_threshold if self.lockout_threshold else 'Not Configured'}\n"
+            f"Password Settings  : {self.pso if self.pso else 'Default Policy'}\n"
+            f"Tested Passwords   : {len(self.tested_passwords)} tested\n"
+            f"Time Delta         : {self.time_delta if self.time_delta else 'Not Calculated'}\n"
+        )

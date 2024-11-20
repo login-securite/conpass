@@ -27,7 +27,7 @@ def spray(
         typer.Option("--domain", "-d", help="Domain name", rich_help_panel="Authentication"),
     ],
     password_file: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--password-file",
             "-P",
@@ -39,7 +39,7 @@ def spray(
             autocompletion=complete_path,
             rich_help_panel="Spray",
         ),
-    ],
+    ] = None,
     username: Annotated[
         str | None,
         typer.Option("--username", "-u", help="Domain user", rich_help_panel="Authentication"),
@@ -193,12 +193,15 @@ def spray(
         logger.error("When using --users-file, --lockout-threshold and --lockout-observation-window are required")
         raise typer.Exit(code=1)
 
-    with open(password_file) as f:
-        nb_passwords = sum(bl.count("\n") for bl in blocks(f))
-        if nb_passwords > 100:
-            res = console.input(f"[yellow]The password file has {nb_passwords} passwords. It will take a very long time to try them all[/yellow]\nDo you want to continue? \\[y/N] ")
-            if not res.lower().startswith('y'):
-                raise typer.Exit(code=1)
+    if password_file is not None:
+        with open(password_file) as f:
+            nb_passwords = sum(bl.count("\n") for bl in blocks(f))
+            if nb_passwords > 100:
+                res = console.input(f"[yellow]The password file has {nb_passwords} passwords. It will take a very long time to try them all[/yellow]\nDo you want to continue? \\[y/N] ")
+                if not res.lower().startswith('y'):
+                    raise typer.Exit(code=1)
+    else:
+        disable_spray = True
 
     try:
         thread_pool = ThreadPool(

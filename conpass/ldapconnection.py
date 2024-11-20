@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from ldap3 import ALL, NTLM, Connection, Server
 
 from conpass.passwordpolicy import PasswordPolicy
@@ -112,7 +114,7 @@ class LdapConnection:
             self.__console.print(f"[red]An error occurred while retrieving {samaccountname}: {e!s}[/red]")
             raise
 
-        return entries[0].badPwdCount.value, entries[0].badPasswordTime.value
+        return entries[0].badPwdCount.value, entries[0].badPasswordTime.value if entries[0].badPasswordTime.value is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
 
     def get_active_users(self, psos, domain_policy, time_delta, security_threshold, file_users):
         search_base = self.__base_dn
@@ -179,10 +181,12 @@ class LdapConnection:
                 self.__console.print(f"{entry.samAccountName} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
                 continue
 
+
+
             user = User(
                 samaccountname=entry.samAccountName.value,
                 dn=entry.distinguishedName.value,
-                bad_password_time=entry.badPasswordTime.value,
+                bad_password_time=entry.badPasswordTime.value if entry.badPasswordTime.value is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
                 bad_password_count=entry.badPwdCount.value,
                 lockout_window=lockout_window,
                 lockout_threshold=lockout_threshold,

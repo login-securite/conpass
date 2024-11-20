@@ -46,6 +46,8 @@ class Worker(threading.Thread):
                             continue
                         user.lock()
                     if user.test_password(password, self.__smb_connection, self.__locked_out_users):
+                        if user.account_restricted:
+                            continue
                         ext = ''
                         if user.password_expired:
                             ext = ' (Password expired)'
@@ -53,7 +55,7 @@ class Worker(threading.Thread):
                             ext = ' (Account expired)'
                         self.__console.print(f"[yellow]{user.samaccountname} - {password}[/yellow][bright_black]{ext}[/bright_black]")
                     user.unlock()
-                    time.sleep(0.5)
+                    time.sleep(0.1)
             time.sleep(0.1)
 
 
@@ -116,6 +118,7 @@ class ThreadPool:
         self.__console.print("[yellow]Emergency command:[/yellow] [red]Search-ADAccount -LockedOut | Unlock-ADAccount[/red]")
         self.get_required_informations()
         if self.__disable_spray:
+            self.__console.print("[yellow]Password spraying operation skipped: no password file provided or the feature was explicitly disabled.[/yellow]")
             return True
         self.start_threads()
         self.start_password_spray()
@@ -145,7 +148,7 @@ class ThreadPool:
             statistics = res['stats']
 
             self.__console.rule('Password Policies')
-            password_policies_table.add_column('Nb of users')
+            password_policies_table.add_column('Nb of enabled users')
             password_policies_table.add_row(
                 "Default Domain Policy",
                 str(self.__default_domain_policy.lockout_threshold),

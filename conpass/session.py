@@ -13,6 +13,7 @@ class Session:
         INVALID_PASSWORD = 0x08
         SMB_CLOSED = 0x10
         ACCOUNT_LOCKOUT = 0x20
+        ACCOUNT_RESTRICTION = 0x40
 
     def __init__(self, address, target_ip, domain, console):
         self.address = address
@@ -58,6 +59,8 @@ class Session:
                 return Session.STATUS.ACCOUNT_EXPIRED
             if 'STATUS_LOGON_FAILURE' in str(e):
                 return Session.STATUS.INVALID_PASSWORD
+            if 'STATUS_ACCOUNT_RESTRICTION' in str(e):
+                return Session.STATUS.ACCOUNT_RESTRICTION
 
             self.console.print(f"Unexpected error for {username}. Please create an issue containing this error: {e}")
             return Session.STATUS.INVALID_PASSWORD
