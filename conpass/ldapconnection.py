@@ -86,15 +86,8 @@ class LdapConnection:
     def can_read_pso(self):
         return self.__can_read_psos
 
-    def get_user_password_status(self, samaccountname):
+    def search_users(self, search_filter, attributes, page_size=100, custom_processing=None):
         search_base = self.__base_dn
-        search_filter = f"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={samaccountname}))"
-        attributes = [
-            'samAccountName',
-            'badPwdCount',
-            'badPasswordTime'
-        ]
-        page_size = 100
         cookie = None
         entries = []
         try:
@@ -111,13 +104,29 @@ class LdapConnection:
                 if not cookie:
                     break
         except Exception as e:
-            self.__console.print(f"[red]An error occurred while retrieving {samaccountname}: {e!s}[/red]")
+            self.__console.print(f"[red]An error occurred during LDAP search: {e!s}[/red]")
             raise
 
-        return entries[0].badPwdCount.value, entries[0].badPasswordTime.value if entries[0].badPasswordTime.value is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
+        if custom_processing:
+            return [custom_processing(entry) for entry in entries]
+
+        return entries
+
+    def get_user_password_status(self, samaccountname):
+        search_filter = f"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={samaccountname}))"
+        attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime']
+
+        def process_entry(entry):
+            return (
+                entry.badPwdCount.value,
+                entry.badPasswordTime.value if entry.badPasswordTime.value is not None else datetime(1970, 1, 1,
+                                                                                                     tzinfo=timezone.utc)
+            )
+
+        results = self.search_users(search_filter, attributes, page_size=100, custom_processing=process_entry)
+        return results[0] if results else None
 
     def get_active_users(self, psos, domain_policy, time_delta, security_threshold, file_users):
-        search_base = self.__base_dn
         search_filter = "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(sAMAccountName=*$)))"
         attributes = [
             'samAccountName',
@@ -126,67 +135,34 @@ class LdapConnection:
             'distinguishedName',
             'msDS-ResultantPSO'
         ]
-        page_size = 1000
-        cookie = None
-        entries = []
-        try:
-            while True:
-                self.__conn.search(
-                    search_base,
-                    search_filter,
-                    attributes=attributes,
-                    paged_size=page_size,
-                    paged_cookie=cookie
-                )
-                entries.extend(self.__conn.entries)
-                cookie = self.__conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
-                if not cookie:
-                    break
-        except Exception as e:
-            self.__console.print(f"[red]An error occurred while retrieving active users: {e!s}[/red]")
-            raise
 
-        users = []
-        statistics = {'total_users': len(entries),
-                      'pso': {}}
-        for entry in entries:
+        def process_entry(entry):
             if entry.samAccountName.value == self.__username:
-                continue
+                return None
 
-            # User file provided, discard all users not in that list
             if len(file_users) > 0 and entry.samAccountName.value not in file_users:
-                continue
+                return None
+
             if entry['msDS-ResultantPSO']:
                 pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
-                if pso_name not in statistics['pso']:
-                    statistics['pso'][pso_name] = 1
-                else:
-                    statistics['pso'][pso_name] += 1
-
-                if not self.__can_read_psos:
-                    continue
-
-                pso = self.get_pso(pso_name, psos)
-                if pso is None:
-                    continue
-                lockout_threshold = pso.lockout_threshold
-                lockout_window = pso.lockout_window
+                pso = self.get_pso(pso_name, psos) if self.__can_read_psos else None
+                lockout_threshold = pso.lockout_threshold if pso else domain_policy.lockout_threshold
+                lockout_window = pso.lockout_window if pso else domain_policy.lockout_window
             else:
                 pso = None
                 lockout_threshold = domain_policy.lockout_threshold
                 lockout_window = domain_policy.lockout_window
 
-            # TODO Check if < or <= here, depending on further tests. <= to be sure
             if 0 < lockout_threshold <= security_threshold:
-                self.__console.print(f"{entry.samAccountName} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
-                continue
+                self.__console.print(
+                    f"{entry.samAccountName.value} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
+                return None
 
-
-
-            user = User(
+            return User(
                 samaccountname=entry.samAccountName.value,
                 dn=entry.distinguishedName.value,
-                bad_password_time=entry.badPasswordTime.value if entry.badPasswordTime.value is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
+                bad_password_time=entry.badPasswordTime.value if entry.badPasswordTime.value is not None else datetime(
+                    1970, 1, 1, tzinfo=timezone.utc),
                 bad_password_count=entry.badPwdCount.value,
                 lockout_window=lockout_window,
                 lockout_threshold=lockout_threshold,
@@ -196,7 +172,9 @@ class LdapConnection:
                 console=self.__console
             )
 
-            users.append(user)
+        results = self.search_users(search_filter, attributes, page_size=1000, custom_processing=process_entry)
+        users = [user for user in results if user]
+        statistics = {'total_users': len(users), 'pso': {}}  # Ajuster si nécessaire
 
         return {'users': users, 'stats': statistics}
 
