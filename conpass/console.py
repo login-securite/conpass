@@ -151,6 +151,15 @@ def spray(
         ),
     ] = None,
 
+    use_ssl: Annotated[
+        bool,
+        typer.Option(
+            "--use-ssl",
+            help="Uses LDAP over SSL/TLS (port 636)",
+            rich_help_panel="Authentication",
+        ),
+    ] = False,
+
     use_kerberos: Annotated[
         bool,
         typer.Option(
@@ -208,6 +217,7 @@ def spray(
             username,
             password,
             domain,
+            use_ssl,
             dc_ip,
             dc_host,
             password_file,

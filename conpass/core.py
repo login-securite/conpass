@@ -65,6 +65,7 @@ class ThreadPool:
             username,
             password,
             domain,
+            use_ssl,
             dc_ip,
             dc_host,
             password_file,
@@ -82,6 +83,7 @@ class ThreadPool:
         self.__username = username
         self.__password = password
         self.__domain = domain
+        self.__use_ssl = use_ssl
         self.__base_dn = ','.join(f'dc={domain_part}' for domain_part in self.__domain.split('.'))
         self.__dc_ip = dc_ip
         self.__dc_host = dc_host
@@ -204,6 +206,7 @@ class ThreadPool:
                 domain=self.__domain,
                 username=self.__username,
                 password=self.__password,
+                use_ssl=self.__use_ssl,
                 page_size=200,
                 console=self.__console
             )
@@ -226,6 +229,7 @@ class ThreadPool:
                     domain=self.__domain,
                     username=self.__username,
                     password=self.__password,
+                    use_ssl=self.__use_ssl,
                     page_size=200,
                     console=self.__console
                 ),

@@ -7,19 +7,23 @@ from conpass.user import User
 
 
 class LdapConnection:
-    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, page_size=200, console=None):
+    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
         self.__dc_ip = dc_ip
         self.__base_dn = base_dn
         self.__domain = domain
         self.__username = username
         self.__password = password
+        self.__use_ssl = use_ssl
         self.__console = console
         self.__page_size = page_size
         self.__can_read_psos = False
         self.__conn = None
 
     def get_connection(self):
-        server = Server(self.__dc_ip, get_info=ALL)
+        if not self.__use_ssl:
+            server = Server(self.__dc_ip, get_info=ALL)
+        else:
+            server = Server(self.__dc_ip, port=636, use_ssl=True, get_info=ALL)
         self.__conn = Connection(
             server,
             user=f"{self.__domain}\\{self.__username}",
