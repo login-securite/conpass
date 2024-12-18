@@ -1,14 +1,16 @@
+import socket
 from datetime import datetime, timezone
 
-from ldap3 import ALL, NTLM, Connection, Server
+from ldap3 import ALL, NTLM, Connection, Server, SUBTREE
 
 from conpass.passwordpolicy import PasswordPolicy
 from conpass.user import User
 
 
 class LdapConnection:
-    def __init__(self, dc_ips, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
-        self.__dc_ips = dc_ips
+    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
+        self.__dc_ip = dc_ip
+        self.__all_dc_ips = []
         self.__base_dn = base_dn
         self.__domain = domain
         self.__username = username
@@ -18,25 +20,61 @@ class LdapConnection:
         self.__page_size = page_size
         self.__can_read_psos = False
         self.__conns = []
+        self.__users_statistic = {'enabled': 0, 'disabled': 0, 'locked': 0, 'psos': {}}
 
-    def get_connection(self):
-        for dc_ip in self.__dc_ips:
-            if not self.__use_ssl:
-                server = Server(dc_ip, get_info=ALL)
-            else:
-                server = Server(dc_ip, port=636, use_ssl=True, get_info=ALL)
-            self.__conns.append(Connection(
-                server,
-                user=f"{self.__domain}\\{self.__username}",
-                password=self.__password,
-                authentication=NTLM
-            ))
-        return self
+    def get_connection(self, dc_ip):
+        if not self.__use_ssl:
+            server = Server(dc_ip, get_info=ALL)
+        else:
+            server = Server(dc_ip, port=636, use_ssl=True, get_info=ALL)
+        return Connection(
+            server,
+            user=f"{self.__domain}\\{self.__username}",
+            password=self.__password,
+            authentication=NTLM
+        )
+
+    def get_connections(self):
+        if len(self.__all_dc_ips) == 0:
+            self.get_dc_ips()
+        for dc_ip in self.__all_dc_ips:
+            self.__conns.append(self.get_connection(dc_ip))
 
     def login(self):
         if len(self.__conns) == 0:
-            self.get_connection()
+            if len(self.__all_dc_ips) == 0:
+                try:
+                    self.get_dc_ips()
+                except Exception as e:
+                    self.__console.print(f"An error occurred while retrieving domain controller IPs: {e!s}")
+                    return False
+            for dc_ip in self.__all_dc_ips:
+                self.__conns.append(self.get_connection(dc_ip))
         return all(conn.bind() for conn in self.__conns)
+
+    def get_dc_ips(self):
+        if len(self.__all_dc_ips) > 0:
+            return self.__all_dc_ips
+        conn = self.get_connection(self.__dc_ip)
+        if not conn.bind():
+            raise Exception(f"Couldn't bind to {self.__dc_ip}")
+        search_base = self.__base_dn
+        search_filter = "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
+        attributes = [
+            'dNSHostName'
+        ]
+
+        conn.search(search_base=search_base, search_filter=search_filter, search_scope=SUBTREE, attributes=attributes)
+
+        for entry in conn.entries:
+            dns_name = entry.dNSHostName.value
+            if dns_name:
+                try:
+                    ip_address = socket.gethostbyname(dns_name)
+                    self.__all_dc_ips.append(ip_address)
+                except socket.gaierror:
+                    pass
+        return self.__all_dc_ips
 
     def get_default_domain_policy(self):
         conn = self.__conns[0]
@@ -113,12 +151,11 @@ class LdapConnection:
                         for key, ex_entry in enumerate(entries):
                             if ex_entry.samAccountName == entry.samAccountName:
                                 new_entry = False
-                                if ex_entry.badPwdCount.value < entry.badPwdCount.value:
+                                if ex_entry.badPwdCount.value is None or (entry.badPwdCount.value is not None and ex_entry.badPwdCount.value < entry.badPwdCount.value):
                                     entries[key] = entry
                                 break
                         if new_entry:
                             entries.append(entry)
-                        #entries
                     cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
                     if not cookie:
                         break
@@ -146,22 +183,48 @@ class LdapConnection:
         return results[0] if results else None
 
     def get_active_users(self, psos, domain_policy, time_delta, security_threshold, file_users):
-        search_filter = "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(sAMAccountName=*$)))"
+        search_filter = "(&(objectClass=user)(!(sAMAccountName=*$)))"
         attributes = [
             'samAccountName',
             'badPwdCount',
             'badPasswordTime',
             'distinguishedName',
-            'msDS-ResultantPSO'
+            'msDS-ResultantPSO',
+            'userAccountControl'
         ]
 
         def process_entry(entry):
-            if entry.samAccountName.value == self.__username:
+            # Check if entry is an enabled or disabled account
+            if entry.userAccountControl.value & 2:
+                self.__users_statistic['disabled'] += 1
                 return None
 
+            self.__users_statistic['enabled'] += 1
+
+            # Check if entry is locked
+            if entry.userAccountControl.value & 16:
+                self.__users_statistic['locked'] += 1
+                return None
+
+            # Add 1 to this user's PSO count if it has one but don't process the user if the user has a PSO and the tool can't read PSOs
+            if entry['msDS-ResultantPSO']:
+                pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
+                if pso_name in self.__users_statistic['psos']:
+                    self.__users_statistic['psos'][pso_name] += 1
+                else:
+                    self.__users_statistic['psos'][pso_name] = 1
+                if not self.__can_read_psos:
+                    return None
+
+            # Check if the user is the one running the tool
+            if entry.samAccountName.value.lower() == self.__username.lower():
+                return None
+
+            # Check if the user is in the file  (if the file is provided)
             if len(file_users) > 0 and entry.samAccountName.value not in file_users:
                 return None
 
+            # Check if the user has a PSO and get its lockout threshold and lockout window
             if entry['msDS-ResultantPSO']:
                 pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
                 pso = self.get_pso(pso_name, psos) if self.__can_read_psos else None
@@ -172,6 +235,7 @@ class LdapConnection:
                 lockout_threshold = domain_policy.lockout_threshold
                 lockout_window = domain_policy.lockout_window
 
+            # Check if the lockout threshold is lower than the security threshold
             if 0 < lockout_threshold <= security_threshold:
                 self.__console.print(
                     f"{entry.samAccountName.value} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
@@ -192,10 +256,7 @@ class LdapConnection:
             )
 
         results = self.search_users(search_filter, attributes, page_size=1000, custom_processing=process_entry)
-        users = [user for user in results if user]
-        statistics = {'total_users': len(users), 'pso': {}}  # Ajuster si nécessaire
-
-        return {'users': users, 'stats': statistics}
+        return [user for user in results if user]
 
     def get_pso(self, name, psos):
         for pso in psos:
@@ -204,6 +265,17 @@ class LdapConnection:
         self.__console.print(f"[yellow]PSO [blue]{name}[/blue] details couldn't be found")
         return None
 
+    def get_enabled_users(self):
+        return self.__users_statistic['enabled']
+
+    def get_disabled_users(self):
+        return self.__users_statistic['disabled']
+
+    def get_locked_users(self):
+        return self.__users_statistic['locked']
+
+    def get_pso_users(self):
+        return self.__users_statistic['psos']
 
     @staticmethod
     def get_window_seconds(t):

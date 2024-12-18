@@ -66,7 +66,7 @@ class ThreadPool:
             password,
             domain,
             use_ssl,
-            dc_ips,
+            dc_ip,
             dc_host,
             password_file,
             user_file,
@@ -85,8 +85,7 @@ class ThreadPool:
         self.__domain = domain
         self.__use_ssl = use_ssl
         self.__base_dn = ','.join(f'dc={domain_part}' for domain_part in self.__domain.split('.'))
-        # TODO => Dynamically fetch all DC IPs
-        self.__dc_ips = dc_ips
+        self.__dc_ip = dc_ip
         self.__dc_host = dc_host
         self.__password_file = password_file
         self.__user_file = user_file
@@ -119,19 +118,19 @@ class ThreadPool:
         self.__console.rule('Important information')
         self.__console.print("[yellow]This tool does its best to find the effective password policy but may be wrong. Use with caution.[/yellow]")
         self.__console.print("[yellow]Emergency command:[/yellow] [red]Search-ADAccount -LockedOut | Unlock-ADAccount[/red]")
-        self.get_required_informations()
+        self.get_required_information()
         if self.__disable_spray:
             self.__console.print("[yellow]Password spraying operation skipped: no password file provided or the feature was explicitly disabled.[/yellow]")
             return True
         self.start_threads()
         self.start_password_spray()
 
-    def get_required_informations(self):
+    def get_required_information(self):
         self.__console.rule('Gathering info')
-        if self.__dc_ips is None:
-            self.__dc_host, self.__dc_ips = Session.get_dc_details(self.__domain)
-        self.__time_delta = Session.get_time_delta(self.__dc_ips[0])
-        self.__console.print(f"Time difference with '{self.__dc_ips[0]}': {self.__time_delta.total_seconds()} seconds")
+        if self.__dc_ip is None:
+            self.__dc_host, self.__dc_ip = Session.get_dc_details(self.__domain)
+        self.__time_delta = Session.get_time_delta(self.__dc_ip)
+        self.__console.print(f"Time difference with '{self.__dc_host}' ({self.__dc_ip}): {self.__time_delta.total_seconds()} seconds")
 
         password_policies_table = Table()
         password_policies_table.add_column('Name')
@@ -141,14 +140,16 @@ class ThreadPool:
         if self.__username is not None:
             # Online version
             self.ldap_init()
-            self.__console.print(f"Successfully connected to all Domain Controllers {self.__dc_ips} via LDAP")
+            all_dc_ips = self.__ldap_connection.get_dc_ips()
+            if len(all_dc_ips) == 0:
+                self.__console.print("[red]No Domain Controller found[/red]")
+                exit()
+            self.__console.print(f"Successfully connected to all Domain Controllers {all_dc_ips} via LDAP")
 
             self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
             self.__psos = self.__ldap_connection.get_psos_details()
-            res = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta,
+            self.__users = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta,
                                                           self.__security_threshold, self.get_users_from_file())
-            self.__users = res['users']
-            statistics = res['stats']
             badpwdcount = {}
             for u in self.__users:
                 if u.bad_password_count in badpwdcount:
@@ -158,8 +159,8 @@ class ThreadPool:
 
             users_table = Table()
             users_table.add_column('Bad Password Count')
-            users_table.add_column('Total')
-            for k, v in badpwdcount.items():
+            users_table.add_column('Total Users')
+            for k, v in sorted(badpwdcount.items()):
                 users_table.add_row(str(k), str(v))
             self.__console.print(users_table)
 
@@ -178,8 +179,18 @@ class ThreadPool:
                         pso.name,
                         str(pso.lockout_threshold),
                         str(pso.lockout_window),
-                        str(statistics['pso'].get(pso.name, 0))
+                        str(self.__ldap_connection.get_pso_users().get(pso.name, 0))
                     )
+            else:
+                # Get PSO details from self.__ldap_connection.get_pso_users()
+                for pso_name, count in self.__ldap_connection.get_pso_users().items():
+                    password_policies_table.add_row(
+                        pso_name,
+                        'N/A',
+                        'N/A',
+                        str(count)
+                    )
+
             self.__console.print(password_policies_table)
         else:
             self.__online = False
@@ -212,10 +223,12 @@ class ThreadPool:
             self.__console.rule('Manual Users')
             self.__console.print(f"Total sprayed users: {len(self.__users)}")
 
+        # Display the number of sprayed users on one line
+        self.__console.print(f"[bold green]Total sprayed users: {len(self.__users)}[/bold green]")
     def ldap_init(self):
         try:
             self.__ldap_connection = LdapConnection(
-                dc_ips=self.__dc_ips,
+                dc_ip=self.__dc_ip,
                 base_dn=self.__base_dn,
                 domain=self.__domain,
                 username=self.__username,
@@ -238,7 +251,7 @@ class ThreadPool:
                 self.__passwords,
                 locked_out_users=self.__locked_out_users,
                 ldap_connection=LdapConnection(
-                    dc_ip=self.__dc_ips,
+                    dc_ip=self.__dc_ip,
                     base_dn=self.__base_dn,
                     domain=self.__domain,
                     username=self.__username,
@@ -285,7 +298,6 @@ class ThreadPool:
                                 progress.update(progress_task, total=progress.tasks[progress_task].total + len(self.__users))
                             completed = sum([len(user.tested_passwords) for user in self.__users])
                             progress.update(progress_task, completed=completed)
-
 
                 except FileNotFoundError:
                     self.__console.print("[red]Password file can not be found. Quitting.[/red]")
