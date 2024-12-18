@@ -66,7 +66,7 @@ class ThreadPool:
             password,
             domain,
             use_ssl,
-            dc_ip,
+            dc_ips,
             dc_host,
             password_file,
             user_file,
@@ -85,7 +85,8 @@ class ThreadPool:
         self.__domain = domain
         self.__use_ssl = use_ssl
         self.__base_dn = ','.join(f'dc={domain_part}' for domain_part in self.__domain.split('.'))
-        self.__dc_ip = dc_ip
+        # TODO => Dynamically fetch all DC IPs
+        self.__dc_ips = dc_ips
         self.__dc_host = dc_host
         self.__password_file = password_file
         self.__user_file = user_file
@@ -127,10 +128,10 @@ class ThreadPool:
 
     def get_required_informations(self):
         self.__console.rule('Gathering info')
-        if self.__dc_ip is None:
-            self.__dc_host, self.__dc_ip = Session.get_dc_details(self.__domain)
-        self.__time_delta = Session.get_time_delta(self.__dc_ip, self.__dc_host)
-        self.__console.print(f"Time difference with '{self.__dc_host}': {self.__time_delta.total_seconds()} seconds")
+        if self.__dc_ips is None:
+            self.__dc_host, self.__dc_ips = Session.get_dc_details(self.__domain)
+        self.__time_delta = Session.get_time_delta(self.__dc_ips[0])
+        self.__console.print(f"Time difference with '{self.__dc_ips[0]}': {self.__time_delta.total_seconds()} seconds")
 
         password_policies_table = Table()
         password_policies_table.add_column('Name')
@@ -140,7 +141,7 @@ class ThreadPool:
         if self.__username is not None:
             # Online version
             self.ldap_init()
-            self.__console.print(f"Successfully connected to '{self.__dc_host}' ({self.__dc_ip}) via LDAP")
+            self.__console.print(f"Successfully connected to all Domain Controllers {self.__dc_ips} via LDAP")
 
             self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
             self.__psos = self.__ldap_connection.get_psos_details()
@@ -148,6 +149,19 @@ class ThreadPool:
                                                           self.__security_threshold, self.get_users_from_file())
             self.__users = res['users']
             statistics = res['stats']
+            badpwdcount = {}
+            for u in self.__users:
+                if u.bad_password_count in badpwdcount:
+                    badpwdcount[u.bad_password_count] += 1
+                else:
+                    badpwdcount[u.bad_password_count] = 1
+
+            users_table = Table()
+            users_table.add_column('Bad Password Count')
+            users_table.add_column('Total')
+            for k, v in badpwdcount.items():
+                users_table.add_row(str(k), str(v))
+            self.__console.print(users_table)
 
             self.__console.rule('Password Policies')
             password_policies_table.add_column('Nb of enabled users')
@@ -201,7 +215,7 @@ class ThreadPool:
     def ldap_init(self):
         try:
             self.__ldap_connection = LdapConnection(
-                dc_ip=self.__dc_ip,
+                dc_ips=self.__dc_ips,
                 base_dn=self.__base_dn,
                 domain=self.__domain,
                 username=self.__username,
@@ -224,7 +238,7 @@ class ThreadPool:
                 self.__passwords,
                 locked_out_users=self.__locked_out_users,
                 ldap_connection=LdapConnection(
-                    dc_ip=self.__dc_ip,
+                    dc_ip=self.__dc_ips,
                     base_dn=self.__base_dn,
                     domain=self.__domain,
                     username=self.__username,

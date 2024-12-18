@@ -78,7 +78,7 @@ class Session:
         return host, ip
 
     @staticmethod
-    def get_time_delta(dc_ip, dc_host):
-        utc_remote_time = NtlmInfo(dc_ip, dc_host).get_server_time()
+    def get_time_delta(dc_ip):
+        utc_remote_time = NtlmInfo(dc_ip, dc_ip).get_server_time()
         utc_local_time = datetime.now(timezone.utc)
         return utc_local_time - utc_remote_time

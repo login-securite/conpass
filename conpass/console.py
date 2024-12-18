@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import re
 from rich.console import Console
 
 from conpass.core import ThreadPool
@@ -138,9 +139,9 @@ def spray(
             rich_help_panel="Spray",
         ),
     ] = False,
-    dc_ip: Annotated[
+    dc_ips: Annotated[
         str | None,
-        typer.Option("--dc-ip", "-D", help="Primary domain controller IP address", rich_help_panel="Authentication"),
+        typer.Option("--dc-ips", "-D", help="All controller IP addresses", rich_help_panel="Authentication"),
     ] = None,
     dc_host: Annotated[
         str | None,
@@ -212,13 +213,22 @@ def spray(
     else:
         disable_spray = True
 
+    if dc_ips:
+        try:
+            dc_ips = dc_ips.split(',')
+            if not all(re.findall(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', dc_ip) for dc_ip in dc_ips):
+                raise Exception(e)
+        except:
+            logger.error("--dc-ips is invalid. Valid example: --dc-ips 192.168.1.101,192.168.1.102")
+            raise typer.Exit(code=1)
+
     try:
         thread_pool = ThreadPool(
             username,
             password,
             domain,
             use_ssl,
-            dc_ip,
+            dc_ips,
             dc_host,
             password_file,
             user_file,

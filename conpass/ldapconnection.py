@@ -7,8 +7,8 @@ from conpass.user import User
 
 
 class LdapConnection:
-    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
-        self.__dc_ip = dc_ip
+    def __init__(self, dc_ips, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
+        self.__dc_ips = dc_ips
         self.__base_dn = base_dn
         self.__domain = domain
         self.__username = username
@@ -17,27 +17,29 @@ class LdapConnection:
         self.__console = console
         self.__page_size = page_size
         self.__can_read_psos = False
-        self.__conn = None
+        self.__conns = []
 
     def get_connection(self):
-        if not self.__use_ssl:
-            server = Server(self.__dc_ip, get_info=ALL)
-        else:
-            server = Server(self.__dc_ip, port=636, use_ssl=True, get_info=ALL)
-        self.__conn = Connection(
-            server,
-            user=f"{self.__domain}\\{self.__username}",
-            password=self.__password,
-            authentication=NTLM
-        )
+        for dc_ip in self.__dc_ips:
+            if not self.__use_ssl:
+                server = Server(dc_ip, get_info=ALL)
+            else:
+                server = Server(dc_ip, port=636, use_ssl=True, get_info=ALL)
+            self.__conns.append(Connection(
+                server,
+                user=f"{self.__domain}\\{self.__username}",
+                password=self.__password,
+                authentication=NTLM
+            ))
         return self
 
     def login(self):
-        if self.__conn is None:
+        if len(self.__conns) == 0:
             self.get_connection()
-        return self.__conn.bind()
+        return all(conn.bind() for conn in self.__conns)
 
     def get_default_domain_policy(self):
+        conn = self.__conns[0]
         search_base = self.__base_dn
         search_filter = "(objectClass=domain)"
         attributes = [
@@ -47,12 +49,12 @@ class LdapConnection:
         ]
 
         try:
-            self.__conn.search(search_base, search_filter, attributes=attributes)
+            conn.search(search_base, search_filter, attributes=attributes)
         except Exception as e:
             self.__console.print(f"[red]An error occurred while retrieving default domain policy: {e!s}[/red]")
             self.__console.print_exception()
             raise
-        entry = self.__conn.entries[0]
+        entry = conn.entries[0]
         return PasswordPolicy(
             'Default Domain Policy',
             entry.lockoutThreshold.value if entry.lockoutThreshold else None,
@@ -60,6 +62,7 @@ class LdapConnection:
         )
 
     def get_psos_details(self):
+        conn = self.__conns[0]
         pso_base_dn = f"CN=Password Settings Container,CN=System,{self.__base_dn}"
         pso_filter = "(objectClass=msDS-PasswordSettings)"
         pso_attributes = [
@@ -69,14 +72,14 @@ class LdapConnection:
         ]
 
         try:
-            if not self.__conn.search(pso_base_dn, pso_filter, attributes=pso_attributes):
+            if not conn.search(pso_base_dn, pso_filter, attributes=pso_attributes):
                 return False
         except Exception as e:
             self.__console.error(f"[red]An error occurred while retrieving PSO details: {e!s}[/red]")
             return False
         self.__can_read_psos = True
 
-        if len(self.__conn.entries) == 0:
+        if len(conn.entries) == 0:
             self.__console.print("No PSO found")
         return [
             PasswordPolicy(
@@ -84,7 +87,7 @@ class LdapConnection:
                 lockout_window=self.get_window_seconds(entry['msDS-LockoutObservationWindow'].value) if entry['msDS-LockoutObservationWindow'] else None,
                 lockout_threshold=entry['msDS-LockoutThreshold'].value if entry['msDS-LockoutThreshold'] else None,
             )
-            for entry in self.__conn.entries
+            for entry in conn.entries
         ]
 
     def can_read_pso(self):
@@ -94,22 +97,34 @@ class LdapConnection:
         search_base = self.__base_dn
         cookie = None
         entries = []
-        try:
-            while True:
-                self.__conn.search(
-                    search_base,
-                    search_filter,
-                    attributes=attributes,
-                    paged_size=page_size,
-                    paged_cookie=cookie
-                )
-                entries.extend(self.__conn.entries)
-                cookie = self.__conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
-                if not cookie:
-                    break
-        except Exception as e:
-            self.__console.print(f"[red]An error occurred during LDAP search: {e!s}[/red]")
-            raise
+        for conn in self.__conns:
+            try:
+                while True:
+                    conn.search(
+                        search_base,
+                        search_filter,
+                        attributes=attributes,
+                        paged_size=page_size,
+                        paged_cookie=cookie
+                    )
+                    
+                    for entry in conn.entries:
+                        new_entry = True
+                        for key, ex_entry in enumerate(entries):
+                            if ex_entry.samAccountName == entry.samAccountName:
+                                new_entry = False
+                                if ex_entry.badPwdCount.value < entry.badPwdCount.value:
+                                    entries[key] = entry
+                                break
+                        if new_entry:
+                            entries.append(entry)
+                        #entries
+                    cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                    if not cookie:
+                        break
+            except Exception as e:
+                self.__console.print(f"[red]An error occurred during LDAP search: {e!s}[/red]")
+                raise
 
         if custom_processing:
             return [custom_processing(entry) for entry in entries]
