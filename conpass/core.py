@@ -1,266 +1,321 @@
-import datetime
-import os
-import queue
 import signal
 import threading
-from queue import Queue
 import time
-import socket
-from rich.console import Console
-from rich.progress import Progress
+from datetime import datetime, timezone
 
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TaskProgressColumn,
+)
+from rich.table import Table
 
 from conpass.ldapconnection import LdapConnection
-from conpass.password import Password
-from conpass.user import USER_STATUS
 from conpass.session import Session
-from conpass.utils import get_list_from_file
+from conpass.user import User
 
 lock = threading.RLock()
 
 
-class QueueProgress:
-    processing = "[green] Processing password file..."
-    waiting = "[green] Waiting for new passwords..."
-
-    def __init__(self):
-        self.progress = Progress()
-        self.task = self.progress.add_task(QueueProgress.waiting, total=0)
-        self.progress.start()
-
-    def add_password(self):
-        self.progress.update(self.task, total=self.progress.tasks[self.task].total + 1)
-        if self.progress.tasks[self.task].description == QueueProgress.waiting:
-            self.progress.update(self.task, description=QueueProgress.processing)
-
-    def task_done(self):
-        self.progress.update(self.task, advance=1)
-        if self.progress.tasks[self.task].completed == self.progress.tasks[self.task].total:
-            self.progress.update(self.task, description=QueueProgress.waiting)
-
-    def stop(self):
-        self.progress.stop()
-
-
 class Worker(threading.Thread):
-    def __init__(self, testing_q, test_user_lock, ldapconnection, smbconnection, queue_progress, security_threshold=2):
+    def __init__(self, users, passwords, locked_out_users, ldap_connection, smb_connection, console, online, tid):
         super().__init__()
-        self.testing_q = testing_q
-        self.test_user_lock = test_user_lock
-        self.ldapconnection = ldapconnection
-        self.smbconnection = smbconnection
-        self.console = self.ldapconnection.console
-        self.queue_progress = queue_progress
-        self.security_threshold = security_threshold
+        self.__users = users
+        self.__passwords = passwords
+        self.__locked_out_users = locked_out_users
+        self.__ldap_connection = ldap_connection
+        self.__smb_connection = smb_connection
+        self.__console = console
+        self.__online = online
+        self.__tid = tid
 
     def run(self):
-        if not self.ldapconnection.login():
+        if not self.__smb_connection.get_session():
             exit(1)
-        if not self.smbconnection.get_session():
+        if self.__online and not self.__ldap_connection.login():
             exit(1)
+
         while True:
-            try:
-                user, password = self.testing_q.get(timeout=0.1)
-            except queue.Empty as e:
-                time.sleep(0.5)
-                continue
+            for password in self.__passwords:
+                for user in self.__users:
+                    if len(self.__locked_out_users) > 0:
+                        exit()
+                    with lock:
+                        if not user.can_be_tested(password, self.__ldap_connection, self.__online):
+                            continue
+                        user.lock()
+                    if user.test_password(password, self.__smb_connection, self.__locked_out_users):
+                        if user.account_restricted:
+                            continue
+                        ext = ''
+                        if user.password_expired:
+                            ext = ' (Password expired)'
+                        elif user.account_expired:
+                            ext = ' (Account expired)'
+                        self.__console.print(f"[yellow]{user.samaccountname} - {password}[/yellow][bright_black]{ext}[/bright_black]")
+                    user.unlock()
+                    time.sleep(0.1)
+            time.sleep(0.1)
 
-            with lock:
-                if user.samaccountname in self.test_user_lock:
-                    self.testing_q.put([user, password])
-                    self.testing_q.task_done()
-                    continue
-                self.test_user_lock.append(user.samaccountname)
-
-            should_test_password = user.should_test_password(self.security_threshold, self.ldapconnection)
-
-            if should_test_password == USER_STATUS.FOUND:
-                self.testing_q.task_done()
-                self.queue_progress.task_done()
-                with lock:
-                    self.test_user_lock.remove(user.samaccountname)
-                continue
-            elif should_test_password == USER_STATUS.THRESHOLD:
-                self.testing_q.put([user, password])
-                self.testing_q.task_done()
-                with lock:
-                    self.test_user_lock.remove(user.samaccountname)
-                continue
-
-            # Can use ldapconnection instead, but no hash authentication implemented
-            user_found = user.test_password(password, conn=self.smbconnection)
-            if user_found:
-                self.console.log(f"[green]Found: {user.samaccountname} - {password.value}[/green]")
-            self.testing_q.task_done()
-            self.queue_progress.task_done()
-            with lock:
-                self.test_user_lock.remove(user.samaccountname)
 
 class ThreadPool:
-    def __init__(self, arguments):
+    def __init__(
+            self,
+            username,
+            password,
+            domain,
+            use_ssl,
+            dc_ip,
+            dc_host,
+            password_file,
+            user_file,
+            lockout_threshold,
+            lockout_observation_window,
+            user_as_pass,
+            security_threshold,
+            max_threads,
+            limit_memory,
+            disable_spray,
+            console
+    ):
+
+        self.__username = username
+        self.__password = password
+        self.__domain = domain
+        self.__use_ssl = use_ssl
+        self.__base_dn = ','.join(f'dc={domain_part}' for domain_part in self.__domain.split('.'))
+        self.__dc_ip = dc_ip
+        self.__dc_host = dc_host
+        self.__password_file = password_file
+        self.__user_file = user_file
+        self.__lockout_threshold = lockout_threshold
+        self.__lockout_observation_window = lockout_observation_window
+        self.__user_as_pass = user_as_pass
+        self.__security_threshold = security_threshold
+        self.__max_threads = max_threads
+        self.__limit_memory = limit_memory
+        self.__disable_spray = disable_spray
+        self.__console = console
+        self.__ldap_connection = None
+        self.__all_threads = []
+
+        self.__time_delta = None
+
+        self.__users = []
+        self.__locked_out_users = []
+        self.__default_domain_policy = None
+        self.__psos = []
+
+        self.__passwords = []
+
+        self.__online = True
+
         signal.signal(signal.SIGINT, self.interrupt_event)
         signal.signal(signal.SIGTERM, self.interrupt_event)
 
-        self.arguments = arguments
-        self.console = Console()
-        self.console.log("[yellow]This tool does its best to find the effective password policy but may be wrong. Use with caution.[/yellow]")
-        self.console.log("[yellow]Emergency command:[/yellow] [red]Search-ADAccount -LockedOut | Unlock-ADAccount[/red]")
-        self.progress = None
-        self.info = False
-        self.debug = False
-        if self.arguments.v > 0:
-            self.info = True
-        if self.arguments.v > 1:
-            self.debug = True
-
-        # Resolve IP address from arguments.domain
-        self.dc_ip = arguments.dc_ip
-        if not self.dc_ip:
-            try:
-                self.dc_ip = socket.gethostbyname(arguments.domain)
-            except socket.gaierror as e:
-                self.console.log(f"Error resolving IP address from {arguments.domain}. Please specify the IP address with -dc-ip")
-                exit(1)
-
-        with self.console.status("Retrieving users and password policies...") as status:
-            self.ldapconnection = LdapConnection(host=self.dc_ip, domain=arguments.domain, username=arguments.username, password=arguments.password, console=status.console, debug=self.debug)
-            if not self.ldapconnection.login():
-                exit(1)
-            session = Session(address=self.dc_ip, target_ip=self.dc_ip, domain=arguments.domain, port=445, console=status.console, debug=self.debug).get_session()
-            utc_remote_time = session.get_remote_time()
-            utc_local_time = datetime.datetime.now(datetime.timezone.utc)
-            time_delta = utc_local_time - utc_remote_time
-            self.debug and status.console.log(f"UTC REMOTE: {utc_remote_time}")
-            self.debug and status.console.log(f"UTC LOCAL: {utc_local_time}")
-            self.debug and status.console.log(f"UTC DIFF: {time_delta.total_seconds()} seconds")
-            if not session.login(arguments.username, arguments.password):
-                exit(1)
-            users = None
-            if self.arguments.user_file:
-                import os.path
-                if not os.path.isfile(self.arguments.user_file):
-                    status.console.log(f"File {self.arguments.user_file} does not exist")
-                    exit()
-                users = get_list_from_file(self.arguments.user_file)
-            # Remove users with only 1 try, or <=N tries if `-S N` provided
-            results = self.ldapconnection.get_users(time_delta, users=users, disabled=False)
-            users = results['users']
-            if not users:
-                status.console.log(f"Couldn't retreive users")
-                exit()
-            self.users = [user for user in users if user.lockout_threshold == 0 or user.lockout_threshold > self.arguments.security_threshold]
-
-            status.console.log(f"{len(set([user.pso.dn for user in self.users if user.readable_pso() in (1, -1)]))} PSO")
-            status.console.log(f"{len(self.users)} users - {'Lockout after ' + str(results['lockout_threshold']) + ' bad attempts (Will stop at ' + str(results['lockout_threshold'] - self.arguments.security_threshold) + ') - Observation window: ' + str(int(-results['lockout_reset']/10000000/60)) + ' min' if results['lockout_threshold'] > 0 else '[red]No lockout[/red]' }")
-            status.console.log(f"{len([user for user in self.users if user.readable_pso() == -1])} users with PSO that [red]can not be read[/red]")
-            status.console.log(f"{len([user for user in self.users if user.readable_pso() == 1])} users with PSO that [green]can be read[/green]")
-        self.threads = []
-        self.max_threads = arguments.threads
-        self.testing_q = Queue()
-        self.test_user_lock = []
-        self.tests = []
-        self.all_users_found = False
-
-    # Start the threads
     def run(self):
-        threading.current_thread().name = "[Core]"
+        self.__console.rule('Important information')
+        self.__console.print("[yellow]This tool does its best to find the effective password policy but may be wrong. Use with caution.[/yellow]")
+        self.__console.print("[yellow]Emergency command:[/yellow] [red]Search-ADAccount -LockedOut | Unlock-ADAccount[/red]")
+        self.get_required_information()
+        if self.__disable_spray:
+            self.__console.print("[yellow]Password spraying operation skipped: no password file provided or the feature was explicitly disabled.[/yellow]")
+            return True
+        self.start_threads()
+        self.start_password_spray()
 
-        # Check if file exists on disk
-        if not os.path.isfile(self.arguments.password_file):
-            self.info and self.console.log(f"File {self.arguments.password_file} does not exist Creating it...")
-            # Create file
-            open(self.arguments.password_file, 'a').close()
+    def get_required_information(self):
+        self.__console.rule('Gathering info')
+        if self.__dc_ip is None:
+            self.__dc_host, self.__dc_ip = Session.get_dc_details(self.__domain)
+        self.__time_delta = Session.get_time_delta(self.__dc_ip)
+        self.__console.print(f"Time difference with '{self.__dc_host}' ({self.__dc_ip}): {self.__time_delta.total_seconds()} seconds")
 
-        self.progress = QueueProgress()
-        # Add "rich" Progress console to each user for future logging
-        for user in self.users:
-            user.console = self.progress.progress.console
+        password_policies_table = Table()
+        password_policies_table.add_column('Name')
+        password_policies_table.add_column('Lockout Threshold')
+        password_policies_table.add_column('Lockout Window (s)')
 
-        # Start one Worker per thread.
-        # Each Worker will retrieve some user/pass from `testing_q` queue and test them
-        for i in range(self.max_threads):
+        if self.__username is not None:
+            # Online version
+            self.ldap_init()
+            all_dc_ips = self.__ldap_connection.get_dc_ips()
+            if len(all_dc_ips) == 0:
+                self.__console.print("[red]No Domain Controller found[/red]")
+                exit()
+            self.__console.print(f"Successfully connected to all Domain Controllers {all_dc_ips} via LDAP")
+
+            self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
+            self.__psos = self.__ldap_connection.get_psos_details()
+            self.__users = self.__ldap_connection.get_active_users(self.__psos, self.__default_domain_policy, self.__time_delta,
+                                                          self.__security_threshold, self.get_users_from_file())
+            badpwdcount = {}
+            for u in self.__users:
+                if u.bad_password_count in badpwdcount:
+                    badpwdcount[u.bad_password_count] += 1
+                else:
+                    badpwdcount[u.bad_password_count] = 1
+
+            users_table = Table()
+            users_table.add_column('Bad Password Count')
+            users_table.add_column('Total Users')
+            for k, v in sorted(badpwdcount.items()):
+                users_table.add_row(str(k), str(v))
+            self.__console.print(users_table)
+
+            self.__console.rule('Password Policies')
+            password_policies_table.add_column('Nb of enabled users')
+            password_policies_table.add_row(
+                "Default Domain Policy",
+                str(self.__default_domain_policy.lockout_threshold),
+                str(self.__default_domain_policy.lockout_window),
+                str(len([user for user in self.__users if user.pso is None]))
+            )
+
+            if self.__ldap_connection.can_read_pso():
+                for pso in self.__psos:
+                    password_policies_table.add_row(
+                        pso.name,
+                        str(pso.lockout_threshold),
+                        str(pso.lockout_window),
+                        str(self.__ldap_connection.get_pso_users().get(pso.name, 0))
+                    )
+            else:
+                # Get PSO details from self.__ldap_connection.get_pso_users()
+                for pso_name, count in self.__ldap_connection.get_pso_users().items():
+                    password_policies_table.add_row(
+                        pso_name,
+                        'N/A',
+                        'N/A',
+                        str(count)
+                    )
+
+            self.__console.print(password_policies_table)
+        else:
+            self.__online = False
+            # Offline version
+            self.__console.print(
+                "[yellow]Building users list based on provided password policy. No online checks will be made.[/yellow]")
+
+            password_policies_table.add_row(
+                "Manual Domain Policy",
+                str(self.__lockout_threshold),
+                str(self.__lockout_observation_window),
+            )
+
+            self.__console.print(password_policies_table)
+
+            # No user provided so users list is constructed based on information given in parameters
+            for username in self.get_users_from_file():
+                self.__users.append(User(
+                    samaccountname=username,
+                    dn=None,
+                    bad_password_count=0,
+                    bad_password_time=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                    lockout_window=self.__lockout_observation_window,
+                    lockout_threshold=self.__lockout_threshold,
+                    pso=None,
+                    time_delta=self.__time_delta,
+                    security_threshold=self.__security_threshold,
+                    console=self.__console
+                ))
+            self.__console.rule('Manual Users')
+            self.__console.print(f"Total sprayed users: {len(self.__users)}")
+
+        # Display the number of sprayed users on one line
+        self.__console.print(f"[bold green]Total sprayed users: {len(self.__users)}[/bold green]")
+    def ldap_init(self):
+        try:
+            self.__ldap_connection = LdapConnection(
+                dc_ip=self.__dc_ip,
+                base_dn=self.__base_dn,
+                domain=self.__domain,
+                username=self.__username,
+                password=self.__password,
+                use_ssl=self.__use_ssl,
+                page_size=200,
+                console=self.__console
+            )
+        except Exception as e:
+            self.__console.error(f"Error in LDAP: {e!s}")
+            raise e
+        if not self.__ldap_connection.login():
+            self.__console.print("[red]LDAP bind failed[/red]")
+            exit()
+
+    def start_threads(self):
+        for i in range(self.__max_threads):
             thread = Worker(
-                self.testing_q,
-                self.test_user_lock,
-                LdapConnection(
-                    host=self.dc_ip,
-                    domain=self.arguments.domain,
-                    username=self.arguments.username,
-                    password=self.arguments.password,
-                    console=self.progress.progress.console,
-                    debug=self.debug
-                ), smbconnection=Session(
-                    address=self.dc_ip,
-                    target_ip=self.dc_ip,
-                    domain=self.arguments.domain,
-                    port=445,
-                    console=self.progress.progress.console,
-                    debug=self.debug),
-                queue_progress=self.progress,
-                security_threshold=self.arguments.security_threshold)
+                self.__users,
+                self.__passwords,
+                locked_out_users=self.__locked_out_users,
+                ldap_connection=LdapConnection(
+                    dc_ip=self.__dc_ip,
+                    base_dn=self.__base_dn,
+                    domain=self.__domain,
+                    username=self.__username,
+                    password=self.__password,
+                    use_ssl=self.__use_ssl,
+                    page_size=200,
+                    console=self.__console
+                ),
+                smb_connection=Session(
+                    address=self.__dc_ip,
+                    target_ip=self.__dc_ip,
+                    domain=self.__domain,
+                    console=self.__console),
+                console=self.__console,
+                online=self.__online,
+                tid=i+1
+            )
+
             thread.daemon = True
-            self.threads.append(thread)
+            self.__all_threads.append(thread)
             thread.start()
 
-        # Always read the password file to discover new passwords
-        while True:
-            try:
-                with open(self.arguments.password_file) as f:
-                    for password in f:
-                        # Ignore blank password
-                        if password.isspace():
-                            continue
-                        # Remove the trailing \n
-                        password = Password(password.strip())
-                        self.all_users_found = self.add_users_password(password, self.progress, self.arguments.limit_memory)
-            except FileNotFoundError:
-                pass
-            if self.all_users_found:
-                self.console.log(f'\n** All users passwords found! **')
-                break
-            time.sleep(0.5)
+    def start_password_spray(self):
+        self.__console.rule('Password Sraying')
+        with Progress("[progress.description]{task.description}",
+                      BarColumn(),
+                      MofNCompleteColumn(),
+                      TaskProgressColumn(),
+                      console=self.__console) as progress:
+            progress_task = progress.add_task("Spraying passwords", total=0)
+            while True:
+                if len(self.__locked_out_users) > 0:
+                    break
+                try:
+                    with open(self.__password_file) as f:
+                        for password in f:
+                            password = password.strip()
+                            # Ignore blank password
+                            if password.isspace() or password == "":
+                                continue
+                            # Remove the trailing \n
+                            if password not in self.__passwords:
+                                self.__passwords.append(password)
+                                progress.update(progress_task, total=progress.tasks[progress_task].total + len(self.__users))
+                            completed = sum([len(user.tested_passwords) for user in self.__users])
+                            progress.update(progress_task, completed=completed)
 
-        # Block until all tasks are done
-        self.testing_q.join()
+                except FileNotFoundError:
+                    self.__console.print("[red]Password file can not be found. Quitting.[/red]")
+                    break
+                time.sleep(1)
 
-    # Add the users/password combination to the queue
-    def add_users_password(self, password, progress, limit_memory=False):
-        self.all_users_found = True
-        for key, user in enumerate(self.users):
-            # Check if user should be tested, depending on lockout policy and PSO
-            user_status = user.should_be_discarded()
+    def get_users_from_file(self):
+        users = []
+        if self.__user_file is None:
+            return users
+        with open(self.__user_file) as f:
+            for username in f:
+                username = username.strip()
+                if username.isspace() or username == '':
+                    continue
+                users.append(username)
+        return users
 
-            # Remove untestable users from list
-            if user_status in (USER_STATUS.UNREADABLE_PSO, USER_STATUS.FOUND):
-                user_status == USER_STATUS.UNREADABLE_PSO and self.info and self.progress.progress.console.log(f"Discarding {user.samaccountname}: [red]PSO unreadable. Use -f to force testing[/red]")
-                del(self.users[key])
-                continue
-            # This account wasn't found so there's at least one account left.
-            self.all_users_found = False
-
-            # If this (user,password) wasn't already added to the test list, then it should be added
-            if user_status in (USER_STATUS.TEST, USER_STATUS.PSO) and not [user, password] in self.tests:
-                if user_status == USER_STATUS.PSO and user not in [test[0] for test in self.tests]:
-                    self.info and self.progress.progress.console.log(f"User {user.samaccountname} has a PSO: {user.pso}")
-                self.debug and self.progress.progress.console.log(f"Adding to queue {user.samaccountname} - {password.value}")
-                # Avoid super big queue to save memory
-                while self.testing_q.qsize() > 30 and limit_memory:
-                    time.sleep(0.5)
-                self.testing_q.put([user, password])
-                self.tests.append([user, password])
-                # Add one test (user,password) to progress bar total
-                progress.add_password()
-        return self.all_users_found
-
-
-
-    # Handle the interrupt signal
     def interrupt_event(self, signum, stack):
-        if self.progress is not None:
-            self.progress.stop()
-        self.console.log(f"** Interrupted! **")
+        self.__console.print("[red]** Interrupted! **[/red]")
         exit()
-
-    # Check if threads are still running
-    def isRunning(self):
-        return any(thread.is_alive() for thread in self.threads)

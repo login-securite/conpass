@@ -1,1 +1,3 @@
-__version__ = '0.0.1'
+from conpass.core import ThreadPool
+
+__all__ = ["ThreadPool"]

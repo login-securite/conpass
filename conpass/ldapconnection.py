@@ -1,250 +1,282 @@
-# Author:
-#  Romain Bentz (pixis - @hackanddo)
-# Website:
-#  https://beta.hackndo.com
-
-import ldap
-from ldap.controls import SimplePagedResultsControl
+import socket
 from datetime import datetime, timezone
-import re
 
-from conpass.pso import PSO
+from ldap3 import ALL, NTLM, Connection, Server, SUBTREE
+
+from conpass.passwordpolicy import PasswordPolicy
 from conpass.user import User
-from conpass.gpo import GPO
-from conpass import utils
-import struct
-
-def convert(binary):
-    version = struct.unpack('B', binary[0:1])[0]
-    # I do not know how to treat version != 1 (it does not exist yet)
-    assert version == 1, version
-    length = struct.unpack('B', binary[1:2])[0]
-    authority = struct.unpack(b'>Q', b'\x00\x00' + binary[2:8])[0]
-    string = 'S-%d-%d' % (version, authority)
-    binary = binary[8:]
-    assert len(binary) == 4 * length
-    for i in range(length):
-        value = struct.unpack('<L', binary[4*i:4*(i+1)])[0]
-        string += '-%d' % value
-    return string
 
 
 class LdapConnection:
-    def __init__(self, host, domain, username, password, console, port=None, ssl=False, page_size=200, debug=False):
-        self.host = host
-        self.domain = domain
-        self.username = username
-        self.password = password
-        self.console = console
-        self.ssl = ssl
-        self.scheme = "ldaps" if self.ssl else "ldap"
-        if port is None:
-            self.port = 636 if self.ssl else 389
+    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
+        self.__dc_ip = dc_ip
+        self.__all_dc_ips = []
+        self.__base_dn = base_dn
+        self.__domain = domain
+        self.__username = username
+        self.__password = password
+        self.__use_ssl = use_ssl
+        self.__console = console
+        self.__page_size = page_size
+        self.__can_read_psos = False
+        self.__conns = []
+        self.__users_statistic = {'enabled': 0, 'disabled': 0, 'locked': 0, 'psos': {}}
+
+    def get_connection(self, dc_ip):
+        if not self.__use_ssl:
+            server = Server(dc_ip, get_info=ALL)
         else:
-            self.port = port
-        self.page_size = page_size
-        self.domain_dn = None
-        self._conn = None
-        self.domain_threshold = 0
-        self.psos = {}
-        self.domain_dn = self.get_domain_dn()
-        if self.domain_dn is None:
-            self.console.log(f"Error: Unable to get domain DN from {self.domain}. Please provide full domain name (e.g. example.com)")
-            exit(1)
-        self.debug = debug
-
-    def get_domain_dn(self):
-        if '.' not in self.domain:
-            return None
-        return ','.join(['DC=' + part for part in self.domain.split('.')])
-
-    def login(self):
-        self._get_conn()
-        if not self.username or not self.password or not self.domain:
-            return None
-        try:
-            self._conn.simple_bind_s('{}@{}'.format(self.username, self.domain), self.password)
-            return True
-        except ldap.SERVER_DOWN:
-            self.console.log("LDAP service unavailable on {}://{}:{}".format(self.scheme, self.host, self.port))
-            if self.debug:
-                self.console.print_exception()
-            return False
-        except ldap.INVALID_CREDENTIALS:
-            self.console.log("Invalid LDAP credentials")
-            if self.debug:
-                self.console.print_exception()
-            return False
-
-    def test_credentials(self, username, password):
-
-        self._get_conn()
-        try:
-            self._conn.simple_bind_s('{}@{}'.format(username, self.domain), password.value)
-            return True
-        except ldap.SERVER_DOWN:
-            self.console.log("Service unavailable on {}://{}:{}".format(self.scheme, self.host, self.port))
-            if self.debug:
-                self.console.print_exception()
-            return False
-        except ldap.INVALID_CREDENTIALS:
-            return False
-        except Exception as e:
-            self.console.log("Unexpected error while trying {}:{}".format(username, password.value))
-            if self.debug:
-                self.console.print_exception()
-            return False
-
-    def get_users(self, time_delta, users=None, disabled=True):
-        filters = ["(objectClass=User)"]
-        if users:
-            if len(users) == 1:
-                filters.append("(samAccountName={})".format(users[0].lower()))
-            else:
-                filters.append("(|")
-                filters.append("".join("(samAccountName={})".format(user.lower()) for user in users))
-                filters.append(")")
-        if not disabled:
-            filters.append("(!(userAccountControl:1.2.840.113556.1.4.803:=2))")
-
-        if len(filters) > 1:
-            filters = '(&' + ''.join(filters) + ')'
-        else:
-            filters = filters[0]
-        try:
-            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'distinguishedName', 'msDS-ResultantPSO']
-            res = self.get_paged_objects(filters, ldap_attributes)
-            lockout_threshold, lockout_reset = self.get_password_policy()
-            results = []
-
-            for dn, entry in res:
-                if isinstance(entry, dict) and entry['sAMAccountName'][0].decode('utf-8')[-1] != '$':
-                    results.append(User(
-                        samaccountname=entry['sAMAccountName'][0].decode('utf-8'),
-                        dn=entry['distinguishedName'][0].decode('utf-8'),
-                        bad_password_count=0 if 'badPwdCount' not in entry else int(entry['badPwdCount'][0]),
-                        last_password_test=datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc) if 'badPasswordTime' not in entry else utils.win_timestamp_to_datetime(int(entry['badPasswordTime'][0].decode('utf-8'))),
-                        lockout_threshold=lockout_threshold,
-                        lockout_reset=lockout_reset,
-                        pso=None if 'msDS-ResultantPSO' not in entry else self.get_policy_from_pso(entry['msDS-ResultantPSO'][0]),
-                        time_delta=time_delta,
-                        console=self.console,
-                        debug=self.debug
-                    ))
-            return {'users': results, 'lockout_threshold': lockout_threshold, 'lockout_reset': lockout_reset}
-
-        except Exception as e:
-            self.console.log("An error occurred while looking for users via LDAP")
-            if self.debug:
-                self.console.print_exception()
-            return False
-
-    def get_user(self, user):
-        filters = ["(objectClass=User)", "(samAccountName={})".format(user.lower())]
-        filters = '(&' + ''.join(filters) + ')'
-
-        try:
-            ldap_attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime']
-            res = self.get_paged_objects(filters, ldap_attributes)
-            bad_pwd_count = 0 if 'badPwdCount' not in res[0][1] else int(res[0][1]['badPwdCount'][0])
-            last_pwd_test = datetime(1970, 1, 1, 0, 00).replace(tzinfo=timezone.utc) if 'badPasswordTime' not in res[0][1] else utils.win_timestamp_to_datetime(int(res[0][1]['badPasswordTime'][0].decode('utf-8')))
-            return last_pwd_test, bad_pwd_count
-
-        except Exception as e:
-            print(e)
-            self.console.log(f"An error occurred while looking for {user} via LDAP")
-            if self.debug:
-                self.console.print_exception()
-            return False
-
-    def get_policy_from_pso(self, pso):
-        if pso in self.psos:
-            return self.psos[pso]
-
-        attributes = ['msDS-LockoutThreshold', 'msDS-PasswordSettingsPrecedence', 'msDS-LockoutObservationWindow', 'msDS-LockoutDuration']
-        pso = pso.decode('utf-8')
-        
-        res = self._conn.search_ext(
-            pso,
-            ldap.SCOPE_SUBTREE,
-            attrlist=attributes
+            server = Server(dc_ip, port=636, use_ssl=True, get_info=ALL)
+        return Connection(
+            server,
+            user=f"{self.__domain}\\{self.__username}",
+            password=self.__password,
+            authentication=NTLM
         )
 
-        try:
-            rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
-        except ldap.NO_SUCH_OBJECT as e:
-            self.psos[pso] = PSO(dn=pso, readable=False)
-            return self.psos[pso]
-        dn, entry = rdata[0]
-        if 'msDS-LockoutThreshold' not in entry:
-            self.psos[pso] = PSO(dn=pso, readable=False)
-        else:
-            self.psos[pso] = PSO(
-                pso,
-                int(entry['msDS-LockoutThreshold'][0].decode('utf-8')),
-                int(entry['msDS-LockoutObservationWindow'][0].decode('utf-8')),
-                int(entry['msDS-LockoutDuration'][0].decode('utf-8')),
-                int(entry['msDS-PasswordSettingsPrecedence'][0].decode('utf-8'))
-            )
-        return self.psos[pso]
+    def get_connections(self):
+        if len(self.__all_dc_ips) == 0:
+            self.get_dc_ips()
+        for dc_ip in self.__all_dc_ips:
+            self.__conns.append(self.get_connection(dc_ip))
 
-    def get_password_policy(self):
+    def login(self):
+        if len(self.__conns) == 0:
+            if len(self.__all_dc_ips) == 0:
+                try:
+                    self.get_dc_ips()
+                except Exception as e:
+                    self.__console.print(f"An error occurred while retrieving domain controller IPs: {e!s}")
+                    return False
+            for dc_ip in self.__all_dc_ips:
+                self.__conns.append(self.get_connection(dc_ip))
+        return all(conn.bind() for conn in self.__conns)
 
-        filter = '(objectClass=domain)'
+    def get_dc_ips(self):
+        if len(self.__all_dc_ips) > 0:
+            return self.__all_dc_ips
+        conn = self.get_connection(self.__dc_ip)
+        if not conn.bind():
+            raise Exception(f"Couldn't bind to {self.__dc_ip}")
+        search_base = self.__base_dn
+        search_filter = "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
+        attributes = [
+            'dNSHostName'
+        ]
+
+        conn.search(search_base=search_base, search_filter=search_filter, search_scope=SUBTREE, attributes=attributes)
+
+        for entry in conn.entries:
+            dns_name = entry.dNSHostName.value
+            if dns_name:
+                try:
+                    ip_address = socket.gethostbyname(dns_name)
+                    self.__all_dc_ips.append(ip_address)
+                except socket.gaierror:
+                    pass
+        return self.__all_dc_ips
+
+    def get_default_domain_policy(self):
+        conn = self.__conns[0]
+        search_base = self.__base_dn
+        search_filter = "(objectClass=domain)"
         attributes = [
             'lockoutThreshold',
+            'lockoutDuration',
             'lockOutObservationWindow'
         ]
 
-        res = self._conn.search_ext(
-            self.domain_dn,
-            ldap.SCOPE_SUBTREE,
-            filter,
-            attributes
-        )
-        _, rdata, _, _ = self._conn.result3(res)
-        dn, entry = rdata[0]
-        return int(entry['lockoutThreshold'][0].decode('utf-8')), int(entry['lockOutObservationWindow'][0].decode('utf-8'))
-
-    def get_paged_objects(self, filters, attributes):
-        pages = 0
-        result = []
-
-        page_control = SimplePagedResultsControl(True, size=self.page_size, cookie='')
-        res = self._conn.search_ext(
-            self.domain_dn,
-            ldap.SCOPE_SUBTREE,
-            filters,
-            attributes,
-            serverctrls=[page_control]
+        try:
+            conn.search(search_base, search_filter, attributes=attributes)
+        except Exception as e:
+            self.__console.print(f"[red]An error occurred while retrieving default domain policy: {e!s}[/red]")
+            self.__console.print_exception()
+            raise
+        entry = conn.entries[0]
+        return PasswordPolicy(
+            'Default Domain Policy',
+            entry.lockoutThreshold.value if entry.lockoutThreshold else None,
+            entry.lockOutObservationWindow.value.total_seconds() if entry.lockOutObservationWindow else None
         )
 
-        while True:
-            pages += 1
-            rtype, rdata, rmsgid, serverctrls = self._conn.result3(res)
-            result.extend(rdata)
-            controls = [ctrl for ctrl in serverctrls if ctrl.controlType == SimplePagedResultsControl.controlType]
-            if not controls:
-                self.console.log('The server ignores RFC 2696 control')
-                break
-            if not controls[0].cookie:
-                break
-            page_control.cookie = controls[0].cookie
-            res = self._conn.search_ext(
-                self.domain_dn,
-                ldap.SCOPE_SUBTREE,
-                filters,
-                attributes,
-                serverctrls=[page_control]
+    def get_psos_details(self):
+        conn = self.__conns[0]
+        pso_base_dn = f"CN=Password Settings Container,CN=System,{self.__base_dn}"
+        pso_filter = "(objectClass=msDS-PasswordSettings)"
+        pso_attributes = [
+            'name',
+            'msDS-LockoutThreshold',
+            'msDS-LockoutObservationWindow'
+        ]
+
+        try:
+            if not conn.search(pso_base_dn, pso_filter, attributes=pso_attributes):
+                return False
+        except Exception as e:
+            self.__console.error(f"[red]An error occurred while retrieving PSO details: {e!s}[/red]")
+            return False
+        self.__can_read_psos = True
+
+        if len(conn.entries) == 0:
+            self.__console.print("No PSO found")
+        return [
+            PasswordPolicy(
+                name=entry.name.value if entry.name else None,
+                lockout_window=self.get_window_seconds(entry['msDS-LockoutObservationWindow'].value) if entry['msDS-LockoutObservationWindow'] else None,
+                lockout_threshold=entry['msDS-LockoutThreshold'].value if entry['msDS-LockoutThreshold'] else None,
             )
-        return result
+            for entry in conn.entries
+        ]
 
-    def _get_conn(self):
-        if self._conn is not None:
-            return True
-        self._conn = ldap.initialize('{}://{}:{}'.format(self.scheme, self.host, self.port))
-        self._conn.set_option(ldap.OPT_NETWORK_TIMEOUT, 3.0)
-        self._conn.protocol_version = 3
-        self._conn.set_option(ldap.OPT_REFERRALS, 0)
-        return True
+    def can_read_pso(self):
+        return self.__can_read_psos
 
+    def search_users(self, search_filter, attributes, page_size=100, custom_processing=None):
+        search_base = self.__base_dn
+        cookie = None
+        entries = []
+        for conn in self.__conns:
+            try:
+                while True:
+                    conn.search(
+                        search_base,
+                        search_filter,
+                        attributes=attributes,
+                        paged_size=page_size,
+                        paged_cookie=cookie
+                    )
+                    
+                    for entry in conn.entries:
+                        new_entry = True
+                        for key, ex_entry in enumerate(entries):
+                            if ex_entry.samAccountName == entry.samAccountName:
+                                new_entry = False
+                                if ex_entry.badPwdCount.value is None or (entry.badPwdCount.value is not None and ex_entry.badPwdCount.value < entry.badPwdCount.value):
+                                    entries[key] = entry
+                                break
+                        if new_entry:
+                            entries.append(entry)
+                    cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                    if not cookie:
+                        break
+            except Exception as e:
+                self.__console.print(f"[red]An error occurred during LDAP search: {e!s}[/red]")
+                raise
+
+        if custom_processing:
+            return [custom_processing(entry) for entry in entries]
+
+        return entries
+
+    def get_user_password_status(self, samaccountname):
+        search_filter = f"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={samaccountname}))"
+        attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime']
+
+        def process_entry(entry):
+            return (
+                entry.badPwdCount.value,
+                entry.badPasswordTime.value if entry.badPasswordTime.value is not None else datetime(1970, 1, 1,
+                                                                                                     tzinfo=timezone.utc)
+            )
+
+        results = self.search_users(search_filter, attributes, page_size=100, custom_processing=process_entry)
+        return results[0] if results else None
+
+    def get_active_users(self, psos, domain_policy, time_delta, security_threshold, file_users):
+        search_filter = "(&(objectClass=user)(!(sAMAccountName=*$)))"
+        attributes = [
+            'samAccountName',
+            'badPwdCount',
+            'badPasswordTime',
+            'distinguishedName',
+            'msDS-ResultantPSO',
+            'userAccountControl'
+        ]
+
+        def process_entry(entry):
+            # Check if entry is an enabled or disabled account
+            if entry.userAccountControl.value & 2:
+                self.__users_statistic['disabled'] += 1
+                return None
+
+            self.__users_statistic['enabled'] += 1
+
+            # Check if entry is locked
+            if entry.userAccountControl.value & 16:
+                self.__users_statistic['locked'] += 1
+                return None
+
+            # Add 1 to this user's PSO count if it has one but don't process the user if the user has a PSO and the tool can't read PSOs
+            if entry['msDS-ResultantPSO']:
+                pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
+                if pso_name in self.__users_statistic['psos']:
+                    self.__users_statistic['psos'][pso_name] += 1
+                else:
+                    self.__users_statistic['psos'][pso_name] = 1
+                if not self.__can_read_psos:
+                    return None
+
+            # Check if the user is the one running the tool
+            if entry.samAccountName.value.lower() == self.__username.lower():
+                return None
+
+            # Check if the user is in the file  (if the file is provided)
+            if len(file_users) > 0 and entry.samAccountName.value not in file_users:
+                return None
+
+            # Check if the user has a PSO and get its lockout threshold and lockout window
+            if entry['msDS-ResultantPSO']:
+                pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
+                pso = self.get_pso(pso_name, psos) if self.__can_read_psos else None
+                lockout_threshold = pso.lockout_threshold if pso else domain_policy.lockout_threshold
+                lockout_window = pso.lockout_window if pso else domain_policy.lockout_window
+            else:
+                pso = None
+                lockout_threshold = domain_policy.lockout_threshold
+                lockout_window = domain_policy.lockout_window
+
+            # Check if the lockout threshold is lower than the security threshold
+            if 0 < lockout_threshold <= security_threshold:
+                self.__console.print(
+                    f"{entry.samAccountName.value} is discarded: Lockout threshold ({lockout_threshold}) is lower than security threshold ({security_threshold})")
+                return None
+
+            return User(
+                samaccountname=entry.samAccountName.value,
+                dn=entry.distinguishedName.value,
+                bad_password_time=entry.badPasswordTime.value if entry.badPasswordTime.value is not None else datetime(
+                    1970, 1, 1, tzinfo=timezone.utc),
+                bad_password_count=entry.badPwdCount.value,
+                lockout_window=lockout_window,
+                lockout_threshold=lockout_threshold,
+                pso=pso,
+                time_delta=time_delta,
+                security_threshold=security_threshold,
+                console=self.__console
+            )
+
+        results = self.search_users(search_filter, attributes, page_size=1000, custom_processing=process_entry)
+        return [user for user in results if user]
+
+    def get_pso(self, name, psos):
+        for pso in psos:
+            if pso.name == name:
+                return pso
+        self.__console.print(f"[yellow]PSO [blue]{name}[/blue] details couldn't be found")
+        return None
+
+    def get_enabled_users(self):
+        return self.__users_statistic['enabled']
+
+    def get_disabled_users(self):
+        return self.__users_statistic['disabled']
+
+    def get_locked_users(self):
+        return self.__users_statistic['locked']
+
+    def get_pso_users(self):
+        return self.__users_statistic['psos']
+
+    @staticmethod
+    def get_window_seconds(t):
+        return -(t / 10000000)

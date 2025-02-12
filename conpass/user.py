@@ -1,136 +1,108 @@
-from enum import Enum
 from datetime import datetime, timedelta, timezone
 
-
-class USER_STATUS(Enum):
-    FOUND = 0
-    THRESHOLD = 1
-    PSO = 2
-    UNREADABLE_PSO = 3
-    TESTED = 4
-    TEST = 5
+from conpass.session import Session
 
 
 class User:
-    def __init__(self, samaccountname, dn, last_password_test, bad_password_count, lockout_reset, lockout_threshold, pso, time_delta, console, debug):
+    def __init__(self, samaccountname, dn, bad_password_count, bad_password_time, lockout_window=None, lockout_threshold=None, pso=None, time_delta=None, security_threshold=None, console=None):
         self.samaccountname = samaccountname
         self.dn = dn
         self.password = None
-        self.last_password_test = last_password_test
+        self.password_expired = False
+        self.account_expired = False
+        self.account_restricted = False
+        self.bad_password_time = bad_password_time
         self.bad_password_count = bad_password_count
-        self.lockout_reset = -(lockout_reset/10000000/60)
+        self.lockout_window = lockout_window
         self.lockout_threshold = lockout_threshold
         self.pso = pso
-        self.first_attempt = True
+        self.tested_passwords = []
         self.time_delta = time_delta
+        self.security_threshold = security_threshold
         self.console = console
-        self.debug = debug
 
-        if self.pso is not None and self.pso.readable:
-            self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
+        # Is this user already in the testing queue
+        self.__cp_lock = False
 
+    def can_be_tested(self, password, ldap_connection, online):
+        # Password already tried
+        if password in self.tested_passwords:
+            return False
 
-        self.debug and self.console.log(f"{self.samaccountname}\tLast pwd test : {self.last_password_test} - Lockout threshold {self.bad_password_count}/{self.lockout_threshold} - Reset {self.lockout_reset} min")
-        self.debug and self.console.log(f"\tWhen it can be changed: {self.last_password_test + timedelta(minutes=self.lockout_reset)}")
-        self.debug and self.console.log(f"\tServer time:            {datetime.now(timezone.utc) - self.time_delta}")
+        if self.password:
+            self.tested_passwords.append(password)
+            return False
 
-    def check_lockout(self, security_threshold):
-        # Skip users with bad password count close to lockout threshold and still in of observation window
-        return self.lockout_threshold > 0 and (
-                self.lockout_threshold <= security_threshold or
-                (
-                        self.bad_password_count >= (self.lockout_threshold - security_threshold)
-                        and (self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=5) > datetime.now(timezone.utc) - self.time_delta)
-                )
-        )
-    def should_test_password(self, security_threshold=1, ldapconnection=None):
-        # Checking all PSO applied to user. If one PSO is not readable (access denied), the user should not be tested
-        # as the PSO might be more strict than the global password policy
+        # Already being tested
+        if self.is_locked():
+            return False
 
-        if self.readable_pso() == -1:
-            return USER_STATUS.UNREADABLE_PSO
+        if self.lockout_threshold > 0:
+            online and self.update(ldap_connection)
+            self.apply_observation_window()
 
-        if self.pso is not None:
-            self.lockout_threshold, self.lockout_reset = self.pso.lockout_threshold, -(self.pso.lockout_window/10000000/60)
+            # Lockout risk
+            if not self.check_lockout(online):
+                return False
 
-        # Skip users if password already found
-        if self.password is not None:
-            return USER_STATUS.FOUND
+        return True
 
-        # Skip users with bad password count close to lockout threshold and still in of observation window
-        if self.check_lockout(security_threshold):
-            return USER_STATUS.THRESHOLD
-
-        # Update user with latest infos in case a real user has entered a bad password
-        # This is only necessary when lockout threshold is > 0 and it is considered to be valid for testing in this tool
-        self.lockout_threshold > 0 and self.update(*ldapconnection.get_user(self.samaccountname))
-
-        # Now, with updated information, check again for lockout risk
-        if self.check_lockout(security_threshold):
-            return USER_STATUS.THRESHOLD
-
-        if self.lockout_threshold > 0 and self.last_password_test + timedelta(minutes=self.lockout_reset) + timedelta(seconds=1) <= datetime.now(timezone.utc) - self.time_delta:
-            # Bad password count is reset to 0
-            self.debug and self.console.log(f"{self.samaccountname} - Reset {self.lockout_reset} min has passed, bad_password_count reset")
-            self.bad_password_count = 0
-
-        if self.lockout_threshold > 0 or self.bad_password_count < (self.lockout_threshold - security_threshold):
-            self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
-        else:
-            self.debug and self.console.log(f"{self.samaccountname} - {self.bad_password_count}/{self.lockout_threshold}")
-            self.debug and self.console.log(f"{self.last_password_test + timedelta(minutes=self.lockout_reset)} is less than...")
-            self.debug and self.console.log(f"{datetime.now(timezone.utc) - self.time_delta} ?")
-
-        self.first_attempt = False
-
-        if self.readable_pso() == 1:
-            return USER_STATUS.PSO
-        return USER_STATUS.TEST
-
-    def update(self, last_password_test, bad_password_count):
-
+    def update(self, ldap_connection):
+        bad_password_count, bad_password_time = ldap_connection.get_user_password_status(self.samaccountname)
         if bad_password_count != self.bad_password_count:
-            update_text = f"{self.samaccountname} 'badPwdCount' changed from {self.bad_password_count} to {bad_password_count}"
-            self.console.log()
-            if self.last_password_test > last_password_test:
-                self.console.log(f"{update_text} - You may have tried the N-1 or N-2 user's password!")
+            if self.bad_password_time > bad_password_time and self.bad_password_count > bad_password_count and len(self.tested_passwords) > 0:
+                self.console.print(f"[yellow]{self.samaccountname}[/yellow] may have [yellow]{self.tested_passwords[-1]}[/yellow] in his password history")
+            """
             else:
-                if self.bad_password_count > bad_password_count:
-                    self.console.log(f"{update_text} - The user may have logged in")
-                else:
-                    self.console.log(f"{update_text} - The user may have entered a bad password")
-            self.console.log(f"{self.last_password_test} to {last_password_test}")
+                self.console.print(f"[yellow]{self.samaccountname}[/yellow] ({update_text})")
+            """
             self.bad_password_count = bad_password_count
 
-        self.last_password_test = last_password_test
+        self.bad_password_time = bad_password_time
 
-    def should_be_discarded(self):
-        # Password already found
-        if self.password is not None:
-            return USER_STATUS.FOUND
+    def is_locked(self):
+        return self.__cp_lock
 
-        # Cannot read PSO, so should be discarded
-        if self.readable_pso() == -1:
-            return USER_STATUS.UNREADABLE_PSO
+    def lock(self):
+        self.__cp_lock = True
 
-        # Has PSO, but can be read, should be tested
-        if self.readable_pso() == 1:
-            return USER_STATUS.PSO
+    def unlock(self):
+        self.__cp_lock = False
 
-        # Default domain policy, should be tested
-        return USER_STATUS.TEST
+    def apply_observation_window(self):
+        # Observation window has passed
+        if self.bad_password_time + timedelta(seconds=self.lockout_window) + timedelta(seconds=1) <= datetime.now(timezone.utc) - self.time_delta:
+            self.bad_password_count = 0
 
-    def readable_pso(self):
-        if self.pso is None:
-            return 0
-        return 1 if self.pso.readable else -1
+    def check_lockout(self, online):
+        if not online:
+            return self.bad_password_count == 0
+        return self.bad_password_count < (self.lockout_threshold - self.security_threshold)
 
-    def test_password(self, password, conn, thread_name=""):
-        self.last_password_test = datetime.now(timezone.utc) - self.time_delta
-        if not conn.test_credentials(self.samaccountname, password):
-            self.bad_password_count += 1
+    def test_password(self, password, smb_connection, locked_out_users):
+        self.bad_password_time = datetime.now(timezone.utc) - self.time_delta
+        res = smb_connection.test_credentials(self.samaccountname, password, locked_out_users)
+        if res == Session.STATUS.SMB_CLOSED:
             return False
+        self.tested_passwords.append(password)
+        if res in (Session.STATUS.INVALID_PASSWORD, Session.STATUS.ACCOUNT_LOCKOUT):
+            self.bad_password_count += 1
+            if res == Session.STATUS.ACCOUNT_LOCKOUT and self.bad_password_count < self.lockout_threshold:
+                self.console.print(
+                    f"[bright_black]Account appears locked out, likely due to synchronization issues between domain controllers. "
+                    f"On the queried DC, 'badPwdCount' is {self.bad_password_count}, which is below the lockout threshold of {self.lockout_threshold}. "
+                    f"This discrepancy suggests the account was locked on another DC where the threshold was reached. "
+                    f"Exiting anyway.[/bright_black]"
+                )
+            return False
+        elif res == Session.STATUS.PASSWORD_EXPIRED:
+            self.password_expired = True
+        elif res == Session.STATUS.ACCOUNT_EXPIRED:
+            self.account_expired = True
+        elif res == Session.STATUS.ACCOUNT_RESTRICTION:
+            self.account_restricted = True
         self.password = password
+        self.bad_password_count = 0
         return True
 
     def __eq__(self, other):
@@ -140,4 +112,20 @@ class User:
         return self.__repr__()
 
     def __repr__(self):
-        return f"User(samAccountName={self.samaccountname}, password={self.password}, last_password_test={self.last_password_test}, bad_password_count={self.bad_password_count}, lockout_reset={self.lockout_reset}, lockout_threshold={self.lockout_threshold}, pso={self.pso})"
+        return (
+            f"User Information:\n"
+            f"------------------\n"
+            f"SAM Account Name  : {self.samaccountname}\n"
+            f"Distinguished Name: {self.dn}\n"
+            f"Password           : {'Set' if self.password else 'Not Set'}\n"
+            f"Password Expired   : {'Yes' if self.password_expired else 'No'}\n"
+            f"Account Expired    : {'Yes' if self.account_expired else 'No'}\n"
+            f"Account Restricted : {'Yes' if self.account_restricted else 'No'}\n"
+            f"Bad Password Count : {self.bad_password_count}\n"
+            f"Bad Password Time  : {self.bad_password_time}\n"
+            f"Lockout Window     : {self.lockout_window if self.lockout_window else 'Not Configured'}\n"
+            f"Lockout Threshold  : {self.lockout_threshold if self.lockout_threshold else 'Not Configured'}\n"
+            f"Password Settings  : {self.pso if self.pso else 'Default Policy'}\n"
+            f"Tested Passwords   : {len(self.tested_passwords)} tested\n"
+            f"Time Delta         : {self.time_delta if self.time_delta else 'Not Calculated'}\n"
+        )

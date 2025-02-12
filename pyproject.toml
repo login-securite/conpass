@@ -1,0 +1,46 @@
+[tool.poetry]
+name = "conpass"
+version = "0.2.0"
+description = "Continuous password spraying tool"
+authors = ["pixis <romain.bentz@login-securite.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+impacket = "^0.12.0"
+rich = "^13.9.2"
+python-ldap = "^3.4.4"
+typer = "^0.12.5"
+pycryptodome = "^3.21.0"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.5.1"
+pre-commit = "^3.7.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+conpass = "conpass.console:app"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",     # Conflicts with formatter
+  "ISC001",     # Conflicts with formatter
+  "E501",       # Line too long
+  "Q000",       # Double quotes checking
+  "FBT002",
+  "BLE001",
+  "PLR0913",
+  "TCH003",
+  "PTH123",
+  "PLR1722",
+
+
+  "ANN",        # Annotations
+  "D",          # Docstrings
+  "N",          # Naming
+]
