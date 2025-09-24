@@ -8,7 +8,7 @@ Python tool for continuous password spraying taking into account the password po
 
 Associated blogposts
 * English: https://en.hackndo.com/password-spraying-lockout/
-* French: https://www.login-securite.com/2024/06/03/spray-passwords-avoid-lockouts/
+* French: https://www.login-securite.com/blog/spray-passwords-avoid-lockouts
 
 | Chapters                                | Description                                     |
 |-----------------------------------------|-------------------------------------------------|
