@@ -122,6 +122,14 @@ def spray(
             rich_help_panel="Spray",
         ),
     ] = 10,
+    timeout: Annotated[
+        int | None,
+        typer.Option(
+            "--timeout",
+            help="Connexions timeout",
+            rich_help_panel="Spray",
+        ),
+    ] = 3,
     limit_memory: Annotated[
         bool | None,
         typer.Option(
@@ -228,6 +236,7 @@ def spray(
             user_as_pass,
             security_threshold,
             max_threads,
+            timeout,
             limit_memory,
             disable_spray,
             console

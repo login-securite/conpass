@@ -76,6 +76,7 @@ class ThreadPool:
             security_threshold,
             max_threads,
             limit_memory,
+            timeout,
             disable_spray,
             console
     ):
@@ -95,6 +96,7 @@ class ThreadPool:
         self.__security_threshold = security_threshold
         self.__max_threads = max_threads
         self.__limit_memory = limit_memory
+        self.__timeout = timeout
         self.__disable_spray = disable_spray
         self.__console = console
         self.__ldap_connection = None
@@ -144,7 +146,7 @@ class ThreadPool:
             if len(all_dc_ips) == 0:
                 self.__console.print("[red]No Domain Controller found[/red]")
                 exit()
-            self.__console.print(f"Successfully connected to all Domain Controllers {all_dc_ips} via LDAP")
+            self.__console.print(f"Successfully connected to Domain Controllers {all_dc_ips} via LDAP")
 
             self.__default_domain_policy = self.__ldap_connection.get_default_domain_policy()
             self.__psos = self.__ldap_connection.get_psos_details()
@@ -235,6 +237,7 @@ class ThreadPool:
                 password=self.__password,
                 use_ssl=self.__use_ssl,
                 page_size=200,
+                timeout=self.__timeout,
                 console=self.__console
             )
         except Exception as e:
@@ -258,6 +261,7 @@ class ThreadPool:
                     password=self.__password,
                     use_ssl=self.__use_ssl,
                     page_size=200,
+                    timeout=self.__timeout,
                     console=self.__console
                 ),
                 smb_connection=Session(

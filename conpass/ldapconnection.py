@@ -1,14 +1,16 @@
 import socket
+import ssl
 from datetime import datetime, timezone
 
-from ldap3 import ALL, NTLM, Connection, Server, SUBTREE
+from ldap3 import ALL, NTLM, Connection, Server, SUBTREE, Tls, TLS_CHANNEL_BINDING
+from ldap3.core.exceptions import LDAPBindError
 
 from conpass.passwordpolicy import PasswordPolicy
 from conpass.user import User
 
 
 class LdapConnection:
-    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, console=None):
+    def __init__(self, dc_ip, base_dn, domain, username=None, password=None, use_ssl=False, page_size=200, timeout=3, console=None):
         self.__dc_ip = dc_ip
         self.__all_dc_ips = []
         self.__base_dn = base_dn
@@ -18,27 +20,46 @@ class LdapConnection:
         self.__use_ssl = use_ssl
         self.__console = console
         self.__page_size = page_size
+        self.__timeout = timeout
         self.__can_read_psos = False
         self.__conns = []
         self.__users_statistic = {'enabled': 0, 'disabled': 0, 'locked': 0, 'psos': {}}
 
-    def get_connection(self, dc_ip):
-        if not self.__use_ssl:
-            server = Server(dc_ip, get_info=ALL)
-        else:
-            server = Server(dc_ip, port=636, use_ssl=True, get_info=ALL)
-        return Connection(
-            server,
-            user=f"{self.__domain}\\{self.__username}",
-            password=self.__password,
-            authentication=NTLM
-        )
+    
+    def create_ldap_server(self, dc_ip, use_ssl):
+        if use_ssl:
+            tls = Tls(validate=ssl.CERT_NONE)
+            return Server(dc_ip, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=self.__timeout)
+        return Server(dc_ip, get_info=ALL, connect_timeout=self.__timeout)
 
-    def get_connections(self):
-        if len(self.__all_dc_ips) == 0:
-            self.get_dc_ips()
-        for dc_ip in self.__all_dc_ips:
-            self.__conns.append(self.get_connection(dc_ip))
+    def get_connection(self, dc_ip):
+        conn = None
+        try:
+            try:
+                server = self.create_ldap_server(dc_ip, True)
+                conn = Connection(
+                    server,
+                    user=f"{self.__domain}\\{self.__username}",
+                    password=self.__password,
+                    authentication=NTLM,
+                    auto_referrals=False,
+                    channel_binding=TLS_CHANNEL_BINDING,
+                )
+                if not conn.bind():
+                    raise LDAPBindError("Channel binding failed")
+            except (ssl.SSLError, socket.error, LDAPBindError) as e:
+                server = self.create_ldap_server(dc_ip, False)
+                conn = Connection(
+                    server,
+                    user=f"{self.__domain}\\{self.__username}",
+                    password=self.__password,
+                    authentication=NTLM
+                )
+                if not conn.bind():
+                    return None
+        except Exception as e:
+            return None
+        return conn
 
     def login(self):
         if len(self.__conns) == 0:
@@ -50,13 +71,21 @@ class LdapConnection:
                     return False
             for dc_ip in self.__all_dc_ips:
                 self.__conns.append(self.get_connection(dc_ip))
-        return all(conn.bind() for conn in self.__conns)
+        
+        if not any(self.__conns):
+            return False
+
+        if not all(self.__conns):
+            self.__console.print(f"Could not bind to all Domain Controllers (Failed for {', '.join(dc_ip for dc_ip, conn in zip(self.__all_dc_ips, self.__conns) if not conn)})")
+            self.__all_dc_ips = [dc_ip for dc_ip, conn in zip(self.__all_dc_ips, self.__conns) if conn]
+            self.__conns = [conn for conn in self.__conns if conn]
+        return True
 
     def get_dc_ips(self):
         if len(self.__all_dc_ips) > 0:
             return self.__all_dc_ips
         conn = self.get_connection(self.__dc_ip)
-        if not conn.bind():
+        if not conn:
             raise Exception(f"Couldn't bind to {self.__dc_ip}")
         search_base = self.__base_dn
         search_filter = "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
@@ -65,14 +94,13 @@ class LdapConnection:
         ]
 
         conn.search(search_base=search_base, search_filter=search_filter, search_scope=SUBTREE, attributes=attributes)
-
         for entry in conn.entries:
             dns_name = entry.dNSHostName.value
             if dns_name:
                 try:
                     ip_address = socket.gethostbyname(dns_name)
                     self.__all_dc_ips.append(ip_address)
-                except socket.gaierror:
+                except socket.gaierror as e:
                     pass
         return self.__all_dc_ips
 
