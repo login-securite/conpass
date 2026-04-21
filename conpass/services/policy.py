@@ -85,14 +85,14 @@ class PolicyService:
 
         for entry in entries:
             # Skip disabled accounts
-            if entry.userAccountControl.value & 2:
+            if (entry.userAccountControl.value or 0) & 2:
                 stats['disabled'] += 1
                 continue
 
             stats['enabled'] += 1
 
             # Skip locked accounts
-            if entry.userAccountControl.value & 16:
+            if (entry.userAccountControl.value or 0) & 16:
                 stats['locked'] += 1
                 continue
 
