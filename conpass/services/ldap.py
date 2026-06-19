@@ -6,7 +6,7 @@ from ldap3 import ALL, NTLM, Connection, Server, SUBTREE, BASE, Tls, TLS_CHANNEL
 from ldap3.core.exceptions import LDAPBindError, LDAPSocketReceiveError
 from rich.console import Console
 
-from conpass.exceptions import LdapConnectionError
+from conpass.exceptions import LdapConnectionError, PdcNotFoundError
 from conpass.models import Credentials, PasswordPolicy
 from conpass.utils import resolve_hostname, parse_hashes, format_hash_for_ldap
 
@@ -32,17 +32,23 @@ class LdapService:
         self.use_ssl = use_ssl
         self.page_size = page_size
         self.timeout = timeout
-        self.dns_ip = dns_ip
+        # Fall back to the target DC as DNS server: a DC is almost always a DNS
+        # server for its domain, and the system resolver usually cannot resolve
+        # the domain FQDNs needed for DC/PDC discovery.
+        self.dns_ip = dns_ip if dns_ip else dc_ip
         self.console = console
         self.debug = debug
 
         self._connections: list[Connection] = []
         self._all_dc_ips: list[str] = []
         self._can_read_psos = False
+        self._pdc_dc_ip: str | None = None
+        self._pdc_discovered: bool = False
+        self._pdc_fqdn: str | None = None
 
     def connect(self) -> None:
         """
-        Connect to all domain controllers.
+        Connect to the PDC Emulator domain controller only.
 
         Raises:
             LdapConnectionError: If unable to connect to any DC
@@ -56,6 +62,42 @@ class LdapService:
             if self.debug and self.console:
                 self.console.print(f"[cyan][DEBUG] Discovered {len(self._all_dc_ips)} DC(s): {', '.join(self._all_dc_ips)}[/cyan]")
 
+        # Find PDC Emulator and use only that DC
+        self._pdc_dc_ip = self._find_pdc_emulator()
+        if self._pdc_dc_ip:
+            if self._pdc_discovered:
+                if self.console:
+                    label = f"{self._pdc_fqdn} ({self._pdc_dc_ip})" if self._pdc_fqdn else self._pdc_dc_ip
+                    self.console.print(f"[green]PDC Emulator identified: {label}[/green]")
+            else:
+                # Fell back to the provided DC: the PDC Emulator could not be
+                # identified, so badPwdCount may not be the authoritative value
+                # and the lockout risk is higher. Let the user decide whether to go on.
+                if self.console:
+                    self.console.print(
+                        f"[yellow]Warning: could not identify the PDC Emulator, falling back to {self._pdc_dc_ip}. "
+                        f"badPwdCount may be out of sync with the PDC, increasing the risk of account lockout.[/yellow]"
+                    )
+                if not self._confirm_continue_without_pdc():
+                    raise PdcNotFoundError(
+                        "Aborted: PDC Emulator could not be identified and the user chose not to continue."
+                    )
+            # Filter to only the PDC DC
+            pdc_ip = self._pdc_dc_ip
+            if pdc_ip not in self._all_dc_ips:
+                if self.debug and self.console:
+                    self.console.print(f"[cyan][DEBUG] PDC Emulator ({pdc_ip}) not in discovered DCs, using it anyway[/cyan]")
+                self._all_dc_ips = [pdc_ip]
+            else:
+                # Move PDC to first position
+                self._all_dc_ips = [pdc_ip] + [ip for ip in self._all_dc_ips if ip != pdc_ip]
+        else:
+            # PDC not found - raise to exit the tool
+            raise PdcNotFoundError(
+                f"PDC Emulator FSMO role holder not found. "
+                f"Cannot proceed without the PDC Emulator."
+            )
+
         # Use progress bar if console is available
         if self.console:
             with Progress(
@@ -65,7 +107,7 @@ class LdapService:
                 console=self.console,
                 transient=True
             ) as progress:
-                task = progress.add_task("Connecting to DCs...", total=len(self._all_dc_ips))
+                task = progress.add_task("Connecting to PDC...", total=len(self._all_dc_ips))
 
                 for dc_ip in self._all_dc_ips:
                     if self.debug:
@@ -85,7 +127,7 @@ class LdapService:
 
         # Check if we have at least one successful connection
         if not any(self._connections):
-            raise LdapConnectionError("Could not connect to any domain controller")
+            raise LdapConnectionError("Could not connect to the PDC Emulator")
 
         # Filter out failed connections
         if not all(self._connections):
@@ -94,10 +136,26 @@ class LdapService:
             ]
             if self.console:
                 self.console.print(
-                    f"[yellow]Could not bind to all Domain Controllers (Failed for {', '.join(failed_dcs)})[/yellow]"
+                    f"[yellow]Could not bind to some Domain Controllers (Failed for {', '.join(failed_dcs)})[/yellow]"
                 )
             self._all_dc_ips = [dc_ip for dc_ip, conn in zip(self._all_dc_ips, self._connections) if conn]
             self._connections = [conn for conn in self._connections if conn]
+
+    def _confirm_continue_without_pdc(self) -> bool:
+        """
+        Ask the user whether to continue when the PDC Emulator could not be identified.
+
+        Returns True to continue (or when no console is available to prompt),
+        False if the user declines.
+        """
+        if not self.console:
+            return True
+        from rich.prompt import Confirm
+        return Confirm.ask(
+            "[yellow]Continue anyway despite the higher lockout risk?[/yellow]",
+            console=self.console,
+            default=False,
+        )
 
     def _create_ldap_server(self, dc_ip: str, use_ssl: bool) -> Server:
         """Create an LDAP server object."""
@@ -165,6 +223,81 @@ class LdapService:
             if self.debug and self.console:
                 self.console.print(f"[cyan][DEBUG] Connection failed to {dc_ip}: {type(e).__name__}[/cyan]")
             return None
+
+    def _find_pdc_emulator(self) -> str | None:
+        """
+        Find the IP address of the Domain Controller holding the PDC Emulator FSMO role.
+
+        Reads the fSMORoleOwner attribute on the domain naming context root. That DN
+        points to the NTDS Settings object of the role owner; its parent is the server
+        object, whose dNSHostName is resolved to an IP.
+
+        Returns:
+            PDC Emulator IP address string, or the provided DC IP as a fallback.
+            None only if no connection could be established.
+        """
+        conn = self._create_connection(self.dc_ip)
+        if not conn:
+            if self.debug and self.console:
+                self.console.print("[yellow][DEBUG] Could not create connection for PDC detection[/yellow]")
+            return None
+
+        try:
+            conn.search(
+                search_base=self.base_dn,
+                search_filter="(objectClass=domainDNS)",
+                search_scope=BASE,
+                attributes=['fSMORoleOwner']
+            )
+
+            owner_dn = None
+            if conn.entries and conn.entries[0].fSMORoleOwner:
+                owner_dn = conn.entries[0].fSMORoleOwner.value
+
+            if owner_dn:
+                if self.debug and self.console:
+                    self.console.print(f"[cyan][DEBUG] PDC fSMORoleOwner DN: {owner_dn}[/cyan]")
+
+                # owner_dn = CN=NTDS Settings,CN=<SERVER>,CN=Servers,CN=<SITE>,...
+                # The server object is the parent of the NTDS Settings object.
+                server_dn = ','.join(owner_dn.split(',')[1:])
+
+                conn.search(
+                    search_base=server_dn,
+                    search_filter="(objectClass=server)",
+                    search_scope=BASE,
+                    attributes=['dNSHostName']
+                )
+
+                if conn.entries and conn.entries[0].dNSHostName:
+                    pdc_fqdn = conn.entries[0].dNSHostName.value
+                    pdc_ip = resolve_hostname(pdc_fqdn, self.dns_ip)
+                    if self.debug and self.console:
+                        self.console.print(f"[cyan][DEBUG] PDC Emulator: {pdc_fqdn} -> {pdc_ip}[/cyan]")
+                    self._pdc_discovered = True
+                    self._pdc_fqdn = pdc_fqdn
+                    return pdc_ip
+
+            # Could not determine the PDC from LDAP: fall back to the provided DC
+            if self.debug and self.console:
+                self.console.print(
+                    f"[yellow][DEBUG] Could not determine PDC Emulator from LDAP, "
+                    f"falling back to provided DC {self.dc_ip}[/yellow]"
+                )
+            return self.dc_ip
+
+        except Exception as e:
+            if self.debug and self.console:
+                self.console.print(
+                    f"[yellow][DEBUG] Error finding PDC Emulator ({type(e).__name__}: {e}), "
+                    f"falling back to provided DC {self.dc_ip}[/yellow]"
+                )
+            return self.dc_ip
+        finally:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
 
     def _discover_domain_controllers(self) -> None:
         """Discover all domain controllers via LDAP query."""
@@ -366,19 +499,22 @@ class LdapService:
 
     def search_users(self, search_filter: str, attributes: list[str]) -> list:
         """
-        Search for users across all domain controllers and return entries with max badPwdCount.
+        Search for users on the PDC Emulator DC only.
 
         Args:
             search_filter: LDAP search filter
             attributes: List of attributes to retrieve
 
         Returns:
-            List of LDAP entries (with max badPwdCount from all DCs)
+            List of LDAP entries from the PDC Emulator
         """
         from rich.progress import Progress, SpinnerColumn, TextColumn
 
         entries = []
         cookie = None
+
+        # Only use the first connection (PDC Emulator)
+        conn = self._connections[0]
 
         # Use spinner to show progress if console available
         if self.console:
@@ -390,88 +526,44 @@ class LdapService:
             ) as progress:
                 task = progress.add_task("Loading users from LDAP...", total=None)
 
-                for conn in self._connections:
-                    cookie = None
-                    try:
-                        while True:
-                            conn.search(
-                                self.base_dn,
-                                search_filter,
-                                attributes=attributes,
-                                paged_size=self.page_size,
-                                paged_cookie=cookie
-                            )
+                while True:
+                    conn.search(
+                        self.base_dn,
+                        search_filter,
+                        attributes=attributes,
+                        paged_size=self.page_size,
+                        paged_cookie=cookie
+                    )
 
-                            for entry in conn.entries:
-                                # Find if user already exists in results
-                                existing_index = None
-                                for idx, ex_entry in enumerate(entries):
-                                    if ex_entry.samAccountName == entry.samAccountName:
-                                        existing_index = idx
-                                        break
+                    for entry in conn.entries:
+                        entries.append(entry)
 
-                                if existing_index is not None:
-                                    # Update if this DC has higher badPwdCount
-                                    ex_entry = entries[existing_index]
-                                    if (ex_entry.badPwdCount.value is None or
-                                        (entry.badPwdCount.value is not None and
-                                         ex_entry.badPwdCount.value < entry.badPwdCount.value)):
-                                        entries[existing_index] = entry
-                                else:
-                                    entries.append(entry)
+                    # Update progress
+                    progress.update(task, description=f"Loading users from LDAP... {len(entries)} loaded")
 
-                            # Update progress
-                            progress.update(task, description=f"Loading users from LDAP... {len(entries)} loaded")
-
-                            cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
-                            if not cookie:
-                                break
-                    except LDAPSocketReceiveError:
-                        # Timeout during search - continue with data already collected
-                        if self.console:
-                            self.console.print(f"[yellow]⚠ LDAP timeout while loading users, continuing with {len(entries)} users already loaded[/yellow]")
+                    cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                    if not cookie:
                         break
-
-            # Display final message after spinner disappears
-            self.console.print(f"[green]✓ Loaded {len(entries)} users from LDAP")
         else:
             # No console - load without progress display
-            for conn in self._connections:
-                cookie = None
-                try:
-                    while True:
-                        conn.search(
-                            self.base_dn,
-                            search_filter,
-                            attributes=attributes,
-                            paged_size=self.page_size,
-                            paged_cookie=cookie
-                        )
+            while True:
+                conn.search(
+                    self.base_dn,
+                    search_filter,
+                    attributes=attributes,
+                    paged_size=self.page_size,
+                    paged_cookie=cookie
+                )
 
-                        for entry in conn.entries:
-                            # Find if user already exists in results
-                            existing_index = None
-                            for idx, ex_entry in enumerate(entries):
-                                if ex_entry.samAccountName == entry.samAccountName:
-                                    existing_index = idx
-                                    break
+                for entry in conn.entries:
+                    entries.append(entry)
 
-                            if existing_index is not None:
-                                # Update if this DC has higher badPwdCount
-                                ex_entry = entries[existing_index]
-                                if (ex_entry.badPwdCount.value is None or
-                                    (entry.badPwdCount.value is not None and
-                                     ex_entry.badPwdCount.value < entry.badPwdCount.value)):
-                                    entries[existing_index] = entry
-                            else:
-                                entries.append(entry)
-
-                        cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
-                        if not cookie:
-                            break
-                except LDAPSocketReceiveError:
-                    # Timeout during search - continue with data already collected
+                cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                if not cookie:
                     break
+
+        if self.console:
+            self.console.print(f"[green]✓ Loaded {len(entries)} users from LDAP")
 
         return entries
 

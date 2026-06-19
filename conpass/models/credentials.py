@@ -21,7 +21,15 @@ class Credentials:
 
     @property
     def user_principal(self) -> str:
-        """Get user principal name for LDAP binding."""
+        """Get user principal name for LDAP binding.
+
+        If the username already carries its own domain (``DOMAIN\\user``), that
+        domain is used for authentication, letting the auth domain differ from
+        the target domain (``-d``) for cross-domain spraying. Otherwise the
+        target domain is used.
+        """
+        if "\\" in self.username:
+            return self.username
         return f"{self.domain}\\{self.username}"
 
     @property

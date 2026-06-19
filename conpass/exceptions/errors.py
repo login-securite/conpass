@@ -23,3 +23,7 @@ class UserLockedOutError(ConpassError):
 
 class ConfigurationError(ConpassError):
     """Configuration error."""
+
+
+class PdcNotFoundError(ConpassError):
+    """PDC Emulator FSMO role holder not found."""

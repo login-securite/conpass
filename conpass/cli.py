@@ -29,7 +29,7 @@ def complete_path():
 def spray(
     # Domain and authentication
     domain: str = typer.Option(..., "--domain", "-d", help="Domain name (FQDN)", rich_help_panel="Authentication"),
-    username: str | None = typer.Option(None, "--username", "-u", help="Domain user", rich_help_panel="Authentication"),
+    username: str | None = typer.Option(None, "--username", "-u", help="Domain user. Use DOMAIN\\user to authenticate in a different domain than the target (-d), e.g. for cross-domain spraying", rich_help_panel="Authentication"),
     password: str | None = typer.Option(None, "--password", "-p", help="Domain password", rich_help_panel="Authentication"),
     hashes: str | None = typer.Option(None, "--hashes", "-H", help="NT hash(es) in format LM:NT, :NT or NT", rich_help_panel="Authentication"),
 
@@ -146,11 +146,13 @@ def spray(
         orchestrator.run()
     except (ConfigurationError, Exception) as e:
         # Import here to avoid circular imports
-        from conpass.exceptions import SmbConnectionError, LdapConnectionError
+        from conpass.exceptions import SmbConnectionError, LdapConnectionError, PdcNotFoundError
 
         # For expected errors, just show the message without stack trace
-        if isinstance(e, (ConfigurationError, SmbConnectionError, LdapConnectionError)):
+        if isinstance(e, (ConfigurationError, SmbConnectionError, LdapConnectionError, PdcNotFoundError)):
             logger.error(str(e))
+            if isinstance(e, PdcNotFoundError):
+                raise typer.Exit(code=1) from None
         else:
             # For unexpected errors, show full stack trace
             logger.critical(str(e))
