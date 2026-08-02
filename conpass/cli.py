@@ -189,7 +189,7 @@ def _validate_inputs(
 
     # Check offline mode requirements
     if username is None and user_file:
-        if not lockout_threshold or not lockout_observation_window:
+        if lockout_threshold is None or not lockout_observation_window:
             raise ConfigurationError(
                 "When using --user-file without --username, "
                 "--lockout-threshold and --lockout-observation-window are required"
