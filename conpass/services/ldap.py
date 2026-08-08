@@ -117,8 +117,6 @@ class LdapService:
             Connection object if successful, None otherwise
         """
 
-        print("DEBUG: USING MODIFIED _create_connection") # Debug
-
         # Determine the password to use (cleartext or hash)
         if self.credentials.has_hash:
             # Parse and format hash for LDAP3
@@ -151,7 +149,6 @@ class LdapService:
                 # Fall back to non-SSL
                 if self.debug and self.console:
                     self.console.print(f"[cyan][DEBUG] SSL failed for {dc_ip} ({type(e).__name__}), trying non-SSL[/cyan]")
-                    f"print({e})" # Debug
                 server = self._create_ldap_server(dc_ip, False)
                 # conn = Connection(
                 #     server,
@@ -171,11 +168,6 @@ class LdapService:
                 #         self.console.print(f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]")
                 #     return conn
                 # return None
-
-                if self.debug and self.console: # debug
-                    self.console.print(
-                        f"[cyan][DEBUG] Attempting non-SSL bind to {dc_ip}[/cyan]"
-                    )
 
                 if conn.bind():
                     if self.debug and self.console:
