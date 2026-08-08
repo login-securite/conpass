@@ -162,7 +162,7 @@ class LdapService:
                 # )
                 conn = Connection( # debug
                     server,
-                    user=self.credentials.user_principal,
+                    user=f"{self.credentials.username}@{self.credentials.domain}",
                     password=password,
                     receive_timeout=self.timeout,
                 )
