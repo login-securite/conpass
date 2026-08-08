@@ -160,10 +160,32 @@ class LdapService:
                     authentication=NTLM,
                     receive_timeout=self.timeout,
                 )
+                # if conn.bind():
+                #     if self.debug and self.console:
+                #         self.console.print(f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]")
+                #     return conn
+                # return None
+
+                if self.debug and self.console: # debug
+                    self.console.print(
+                        f"[cyan][DEBUG] Attempting non-SSL bind to {dc_ip}[/cyan]"
+                    )
+
                 if conn.bind():
                     if self.debug and self.console:
-                        self.console.print(f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]")
+                        self.console.print(
+                            f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]"
+                        )
                     return conn
+
+                if self.debug and self.console:
+                    self.console.print(
+                        f"[red][DEBUG] Non-SSL bind failed to {dc_ip}[/red]"
+                    )
+                    self.console.print(
+                        f"[red][DEBUG] LDAP result: {conn.result}[/red]"
+                    )
+
                 return None
         except Exception as e:
             if self.debug and self.console:
