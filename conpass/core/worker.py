@@ -158,6 +158,7 @@ class Worker(threading.Thread):
             # Update user's bad password info from LDAP (if online)
             if self.online_mode and self.ldap_service:
                 self._update_user_from_ldap(user)
+                before_bad_count = user.get_bad_password_count()
 
             # Check if we can test this password
             can_test, reason = user.can_test_password(password)
@@ -294,6 +295,35 @@ class Worker(threading.Thread):
             # Mark password as tested
             success = status.is_success
             user.mark_password_tested(password, success, user_status)
+
+            # Detect potential n-1 / n-2 password matches
+            before_bad_count = None
+
+            if (
+                self.online_mode and
+                self.ldap_service and
+                status == AuthStatus.INVALID_PASSWORD
+            ):
+                self._update_user_from_ldap(user)
+                after_bad_count = user.get_bad_password_count()
+
+                if (
+                    before_bad_count is not None and
+                    after_bad_count == before_bad_count
+                ):
+                    user.add_history_candidate(password)
+
+                    self.console.print(
+                        f"[cyan]Possible password-history match detected: "
+                        f"{user.samaccountname}/{password}[/cyan]"
+                        )
+
+                    if self.debug:
+                        self.console.print(
+                            f"[cyan]🔍 Possible N-2 match: "
+                            f"{user.samaccountname}/{password} "
+                            f"(badPwdCount remained {before_bad_count})[/cyan]"
+                        )
 
             # Record in database if enabled
             if self.database_service:

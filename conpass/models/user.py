@@ -54,6 +54,7 @@ class User:
         self._found_password: str | None = None
         self._status = UserStatus.PENDING
         self._is_restricted = False  # Account has restrictions (Protected Users, etc.)
+        self._history_candidates: set[str] = set() # # Potential n-1 / n-2 password history matches
 
     def try_acquire_lock(self, blocking: bool = True, timeout: float = -1) -> bool:
         """
@@ -253,6 +254,16 @@ class User:
         """Get bad password count (thread-safe read)."""
         with self._lock:
             return self._bad_password_count
+
+    def add_history_candidate(self, password: str) -> None:
+        """Record a potential n-1 / n-2 password history match."""
+        with self._lock:
+            self._history_candidates.add(password)
+
+    def get_history_candidates(self) -> list[str]:
+        """Get all potential n-1 / n-2 password history matches."""
+        with self._lock:
+            return sorted(self._history_candidates)
 
     def __str__(self) -> str:
         with self._lock:
