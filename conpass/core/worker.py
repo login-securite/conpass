@@ -318,12 +318,11 @@ class Worker(threading.Thread):
                         f"{user.samaccountname}/{password}[/cyan]"
                         )
 
-                    if self.debug:
-                        self.console.print(
-                            f"[cyan]🔍 Possible N-2 match: "
-                            f"{user.samaccountname}/{password} "
-                            f"(badPwdCount remained {before_bad_count})[/cyan]"
-                        )
+                    self.console.print(
+                        f"[cyan]🔍 Possible N-2 match: "
+                        f"{user.samaccountname}/{password} "
+                        f"(badPwdCount remained {before_bad_count})[/cyan]"
+                    )
 
             # Record in database if enabled
             if self.database_service:
