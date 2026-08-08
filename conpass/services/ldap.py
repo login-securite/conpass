@@ -148,6 +148,7 @@ class LdapService:
                 # Fall back to non-SSL
                 if self.debug and self.console:
                     self.console.print(f"[cyan][DEBUG] SSL failed for {dc_ip} ({type(e).__name__}), trying non-SSL[/cyan]")
+                    f"print{e}"
                 server = self._create_ldap_server(dc_ip, False)
                 conn = Connection(
                     server,
