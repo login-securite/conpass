@@ -554,7 +554,15 @@ class SprayOrchestrator:
                 # Update completed count
                 with self.completed_lock:
                     completed = self.completed_count
+
                 progress.update(task, completed=completed)
+
+                # All current work completed and queue is empty
+                if (
+                    self.work_queue.empty()
+                    and completed >= total_tests
+                ):
+                    break
 
                 time.sleep(0.5)
 
