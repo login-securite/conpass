@@ -116,6 +116,7 @@ class LdapService:
         Returns:
             Connection object if successful, None otherwise
         """
+
         # Determine the password to use (cleartext or hash)
         if self.credentials.has_hash:
             # Parse and format hash for LDAP3
@@ -149,17 +150,40 @@ class LdapService:
                 if self.debug and self.console:
                     self.console.print(f"[cyan][DEBUG] SSL failed for {dc_ip} ({type(e).__name__}), trying non-SSL[/cyan]")
                 server = self._create_ldap_server(dc_ip, False)
-                conn = Connection(
+                # conn = Connection(
+                #     server,
+                #     user=self.credentials.user_principal,
+                #     password=password,
+                #     authentication=NTLM,
+                #     receive_timeout=self.timeout,
+                # )
+                conn = Connection( # debug
                     server,
-                    user=self.credentials.user_principal,
+                    user=f"{self.credentials.username}@{self.credentials.domain}",
                     password=password,
-                    authentication=NTLM,
                     receive_timeout=self.timeout,
                 )
+                # if conn.bind():
+                #     if self.debug and self.console:
+                #         self.console.print(f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]")
+                #     return conn
+                # return None
+
                 if conn.bind():
                     if self.debug and self.console:
-                        self.console.print(f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]")
+                        self.console.print(
+                            f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]"
+                        )
                     return conn
+
+                if self.debug and self.console:
+                    self.console.print(
+                        f"[red][DEBUG] Non-SSL bind failed to {dc_ip}[/red]"
+                    )
+                    self.console.print(
+                        f"[red][DEBUG] LDAP result: {conn.result}[/red]"
+                    )
+
                 return None
         except Exception as e:
             if self.debug and self.console:

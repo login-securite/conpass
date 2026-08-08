@@ -62,6 +62,11 @@ class PolicyService:
             raise ValueError("Policies not loaded. Call load_policies() first.")
 
         search_filter = "(&(objectClass=user)(!(sAMAccountName=*$)))"
+
+        if user_filter:
+            user_clauses = "".join(f"(sAMAccountName={username})" for username in user_filter)
+            search_filter = ("(&(objectClass=user)" "(!(sAMAccountName=*$))" f"(|{user_clauses}))")
+        
         attributes = [
             'samAccountName',
             'badPwdCount',
