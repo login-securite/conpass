@@ -297,7 +297,7 @@ class Worker(threading.Thread):
             user.mark_password_tested(password, success, user_status)
 
             # Detect potential n-1 / n-2 password matches
-            before_bad_count = None
+            # before_bad_count = None
 
             if (
                 self.online_mode and
@@ -307,22 +307,30 @@ class Worker(threading.Thread):
                 self._update_user_from_ldap(user)
                 after_bad_count = user.get_bad_password_count()
 
+                self.console.print(
+                    f"DEBUG: user={user.samaccountname} "
+                    f"password={password} "
+                    f"status={status} "
+                    f"before={before_bad_count} "
+                    f"after={after_bad_count}"
+                )
+
                 if (
                     before_bad_count is not None and
                     after_bad_count == before_bad_count
                 ):
                     user.add_history_candidate(password)
 
-                    self.console.print(
-                        f"[cyan]Possible password-history match detected: "
-                        f"{user.samaccountname}/{password}[/cyan]"
-                        )
+                    # self.console.print(
+                    #     f"[cyan]Possible password-history match detected: "
+                    #     f"{user.samaccountname}/{password}[/cyan]"
+                    #     )
 
-                    self.console.print(
-                        f"[cyan]🔍 Possible N-2 match: "
-                        f"{user.samaccountname}/{password} "
-                        f"(badPwdCount remained {before_bad_count})[/cyan]"
-                    )
+                    # self.console.print(
+                    #     f"[cyan]🔍 Possible N-2 match: "
+                    #     f"{user.samaccountname}/{password} "
+                    #     f"(badPwdCount remained {before_bad_count})[/cyan]"
+                    # )
 
             # Record in database if enabled
             if self.database_service:
