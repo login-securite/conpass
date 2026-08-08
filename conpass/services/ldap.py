@@ -153,11 +153,17 @@ class LdapService:
                     self.console.print(f"[cyan][DEBUG] SSL failed for {dc_ip} ({type(e).__name__}), trying non-SSL[/cyan]")
                     f"print({e})" # Debug
                 server = self._create_ldap_server(dc_ip, False)
-                conn = Connection(
+                # conn = Connection(
+                #     server,
+                #     user=self.credentials.user_principal,
+                #     password=password,
+                #     authentication=NTLM,
+                #     receive_timeout=self.timeout,
+                # )
+                conn = Connection( # debug
                     server,
                     user=self.credentials.user_principal,
                     password=password,
-                    authentication=NTLM,
                     receive_timeout=self.timeout,
                 )
                 # if conn.bind():
