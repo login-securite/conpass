@@ -155,9 +155,13 @@ class Worker(threading.Thread):
             if self.debug:
                 self.console.print(f"[cyan]✓ Worker {self.worker_id}: Lock acquired for {user.samaccountname}/{password}[/cyan]")
 
+            before_bad_count = None
+
             # Update user's bad password info from LDAP (if online)
             if self.online_mode and self.ldap_service:
                 self._update_user_from_ldap(user)
+
+                # Capture badPwdCount before authentication attempt
                 before_bad_count = user.get_bad_password_count()
 
             # Check if we can test this password
@@ -296,9 +300,7 @@ class Worker(threading.Thread):
             success = status.is_success
             user.mark_password_tested(password, success, user_status)
 
-            # Detect potential n-1 / n-2 password matches
-            # before_bad_count = None
-
+            # Record passwords that fail authentication without increasing badPwdCount
             if (
                 self.online_mode and
                 self.ldap_service and
@@ -307,30 +309,31 @@ class Worker(threading.Thread):
                 self._update_user_from_ldap(user)
                 after_bad_count = user.get_bad_password_count()
 
-                self.console.print(
-                    f"DEBUG: user={user.samaccountname} "
-                    f"password={password} "
-                    f"status={status} "
-                    f"before={before_bad_count} "
-                    f"after={after_bad_count}"
-                )
-
                 if (
                     before_bad_count is not None and
                     after_bad_count == before_bad_count
                 ):
                     user.add_history_candidate(password)
 
-                    # self.console.print(
-                    #     f"[cyan]Possible password-history match detected: "
-                    #     f"{user.samaccountname}/{password}[/cyan]"
-                    #     )
+                    self.console.print(
+                        f"[yellow]{user.samaccountname} - {password}[/yellow]"
+                        f"[bright_black] (potential history match)[/bright_black]"
+                    )
 
-                    # self.console.print(
-                    #     f"[cyan]🔍 Possible N-2 match: "
-                    #     f"{user.samaccountname}/{password} "
-                    #     f"(badPwdCount remained {before_bad_count})[/cyan]"
-                    # )
+                    if self.debug:
+                        self.console.print(
+                            f"[cyan]History candidate detected: "
+                            f"{user.samaccountname}/{password} "
+                            f"(badPwdCount {before_bad_count} -> {after_bad_count}, "
+                            f"policy={user.policy.name})[/cyan]"
+                        )
+                else:
+                    if self.debug:
+                        self.console.print(
+                            f"[bright_black]Invalid password increased badPwdCount: "
+                            f"{user.samaccountname}/{password} "
+                            f"({before_bad_count} -> {after_bad_count})[/bright_black]"
+                        )
 
             # Record in database if enabled
             if self.database_service:
