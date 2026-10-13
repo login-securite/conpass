@@ -131,3 +131,6 @@ dmypy.json
 # JetBrains
 .idea/
 TODO.md
+
+# Linters
+.ruff_cache/

@@ -1,46 +1,77 @@
-[tool.poetry]
+[project]
 name = "conpass"
 version = "0.3.0"
-description = "Continuous password spraying tool with thread-safe anti-lockout protection"
-authors = ["pixis <romain.bentz@login-securite.com>"]
-license = "MIT"
+description = "Continuous password spraying for Active Directory, without locking accounts out"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Romain Bentz (pixis)", email = "romain.bentz@login-securite.com" }]
+requires-python = ">=3.10"
+keywords = ["active-directory", "password-spraying", "pentest", "lockout", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "dnspython>=2.6",
+    "impacket>=0.13.1",
+    "rich>=13.9",
+    "typer>=0.15",
+]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-impacket = "^0.12.0"
-rich = "^13.9.2"
-ldap3 = {git = "https://github.com/ly4k/ldap3.git"}
-typer = "^0.12.5"
-pycryptodome = "^3.21.0"
-click = "8.1.8"
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8"]
 
-[tool.poetry.group.dev.dependencies]
-ruff = "^0.5.1"
-pre-commit = "^3.7.1"
+[project.scripts]
+conpass = "conpass.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/login-securite/conpass"
+"Blog post (en)" = "https://en.hackndo.com/password-spraying-lockout/"
+"Blog post (fr)" = "https://www.login-securite.com/blog/spray-passwords-avoid-lockouts"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
-[tool.poetry.scripts]
-conpass = "conpass.cli:app"
+[tool.hatch.build.targets.sdist]
+include = ["conpass", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
-  "COM812",     # Conflicts with formatter
-  "ISC001",     # Conflicts with formatter
-  "E501",       # Line too long
-  "Q000",       # Double quotes checking
-  "FBT002",
-  "BLE001",
-  "PLR0913",
-  "TCH003",
-  "PTH123",
-  "PLR1722",
-
-  "ANN",        # Annotations
-  "D",          # Docstrings
-  "N",          # Naming
+    "ANN",      # type annotations are used where they help, not everywhere
+    "BLE001",   # network code catches broad exceptions on purpose, and says why
+    "COM812",   # conflicts with the formatter
+    "CPY001",   # the license is in the LICENSE file
+    "D",        # docstring style is not enforced
+    "E501",     # long lines are allowed in help texts
+    "EM101",    # \
+    "EM102",    #  > plain error messages are clearer here
+    "TRY003",   # /
+    "FBT001",   # boolean arguments are fine in this code base
+    "FBT002",
+    "FBT003",
+    "ISC001",   # conflicts with the formatter
+    "PERF203",  # try/except in loops is needed for network retries
+    "PLR2004",  # magic values are named where it matters
+    "S311",     # random is not used for security
 ]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 9
+
+[tool.ruff.lint.per-file-ignores]
+"conpass/protocols/smb.py" = ["S105"]  # AuthStatus values describe logon outcomes, they are not passwords
+"tests/*" = ["S101", "PLR0913", "SLF001", "INP001"]
