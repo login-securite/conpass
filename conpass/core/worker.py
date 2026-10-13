@@ -279,7 +279,9 @@ class Worker(threading.Thread):
                 dc_now(self.ctx.time_delta) - pwd_last_set < OLD_PASSWORD_CHECK_PERIOD
             if not recent:
                 return KerberosVerdict.CURRENT
-        verdict = verify_password(user.samaccountname, password, self.ctx.domain, self.ctx.pdc_ip)
+        verdict = verify_password(
+            user.samaccountname, password, self.ctx.domain, self.ctx.pdc_ip, self.ctx.time_delta
+        )
         self._debug(f"Kerberos check for {user.samaccountname}: {verdict.value}")
         return verdict
 
