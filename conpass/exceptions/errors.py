@@ -27,3 +27,11 @@ class ConfigurationError(ConpassError):
 
 class PdcNotFoundError(ConpassError):
     """PDC Emulator FSMO role holder not found."""
+
+
+class AuthAttemptLostError(ConpassError):
+    """The connection dropped during an authentication attempt.
+
+    The DC may or may not have processed the attempt, so it must be counted as a
+    failure and must not be replayed blindly.
+    """

@@ -44,7 +44,7 @@ def spray(
     user_file: Path | None = typer.Option(None, "--user-file", "-U", exists=True, file_okay=True, readable=True, resolve_path=True, help="File containing users to test", autocompletion=complete_path, rich_help_panel="Spray"),
     database_path: Path | None = typer.Option(None, "--database", "-db", file_okay=True, resolve_path=True, help="SQLite database path to track tested credentials (default: ~/.config/conpass/conpass.db)", autocompletion=complete_path, rich_help_panel="Spray"),
     user_as_pass: bool = typer.Option(False, "--user-as-pass", "-a", help="Enable user-as-pass for each user", rich_help_panel="Spray"),
-    security_threshold: int = typer.Option(2, "--security-threshold", "-s", help="Number of remaining attempts before lockout threshold", rich_help_panel="Spray"),
+    security_threshold: int = typer.Option(2, "--security-threshold", "-s", min=1, help="Number of attempts kept unused below the lockout threshold (min 1)", rich_help_panel="Spray"),
     disable_spray: bool = typer.Option(False, "--disable-spray", help="Disable password spraying (retrieve PSO details only)", rich_help_panel="Spray"),
 
     # Manual policy (offline mode)
@@ -54,7 +54,7 @@ def spray(
     # Performance
     max_threads: int = typer.Option(10, "--max-threads", "-m", help="Maximum number of threads", rich_help_panel="Spray"),
     timeout: int = typer.Option(3, "--timeout", help="Connection timeout in seconds", rich_help_panel="Spray"),
-    limit_memory: bool = typer.Option(False, "--limit-memory", "-l", help="Limit queue size (useful for 10k+ users)", rich_help_panel="Spray"),
+    limit_memory: bool = typer.Option(False, "--limit-memory", "-l", hidden=True, help="Deprecated, memory no longer grows with users x passwords", rich_help_panel="Spray"),
 
     # Debug
     debug: bool = typer.Option(False, "--debug", help="Enable debug messages", rich_help_panel="Spray"),
@@ -330,7 +330,7 @@ def _show_found_credentials(
     # Get successful credentials
     successful_creds = db_service.get_successful_credentials()
 
-    if not successful_creds:
+    if not successful_creds and not db_service.get_previous_passwords():
         console.print("[yellow]No credentials found yet.[/yellow]")
         console.print("[yellow]Run conpass without --show to start testing passwords.[/yellow]")
         db_service.close()
@@ -346,6 +346,15 @@ def _show_found_credentials(
 
     console.print(table)
     console.print(f"\n[green]✓ Found {len(successful_creds)} valid credential(s)[/green]")
+
+    previous_passwords = db_service.get_previous_passwords()
+    if previous_passwords:
+        table = Table(title=f"Previous Passwords ({len(previous_passwords)})")
+        table.add_column("Username", style="cyan")
+        table.add_column("Previous password", style="magenta")
+        for username, password in sorted(previous_passwords):
+            table.add_row(username, password)
+        console.print(table)
 
     db_service.close()
     raise typer.Exit(code=0)

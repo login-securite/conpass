@@ -1,459 +1,330 @@
-"""Worker thread for password spraying with thread-safe anti-lockout logic."""
+"""Worker thread testing passwords on users handed out by the scheduler."""
 
-import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 
 from rich.console import Console
 
+from conpass.core.scheduler import Scheduler
 from conpass.core.status import AuthStatus
-from conpass.exceptions import SmbConnectionError, UserLockedOutError
-from conpass.models import User, UserStatus
+from conpass.exceptions import AuthAttemptLostError, SmbConnectionError, UserLockedOutError
+from conpass.models import LockoutState, User, UserStatus
 from conpass.services.database import DatabaseService
+from conpass.services.kerberos import KerberosVerdict, verify_password
 from conpass.services.ldap import LdapService
 from conpass.services.smb import SmbService
+from conpass.utils import dc_now
+
+# Above the 5 min default of OldPasswordAllowedPeriod, to cover customized values
+OLD_PASSWORD_CHECK_PERIOD = timedelta(hours=1)
+# Second read before concluding that a failure was not counted
+UNCOUNTED_CONFIRM_DELAY = 1.0
+# Delay before retrying a user after an unexpected error
+ERROR_RETRY_DELAY = 5.0
+
+SUCCESS_DISPLAY = {
+    AuthStatus.SUCCESS: (UserStatus.PASSWORD_FOUND, ""),
+    AuthStatus.PASSWORD_EXPIRED: (UserStatus.PASSWORD_EXPIRED, "Password expired"),
+    AuthStatus.PASSWORD_MUST_CHANGE: (UserStatus.PASSWORD_EXPIRED, "Password must be changed"),
+    AuthStatus.ACCOUNT_EXPIRED: (UserStatus.ACCOUNT_EXPIRED, "Account expired"),
+    AuthStatus.ACCOUNT_DISABLED: (UserStatus.ACCOUNT_DISABLED, "Account disabled"),
+    AuthStatus.INVALID_WORKSTATION: (UserStatus.LOGON_RESTRICTED, "Logon restricted to some workstations"),
+    AuthStatus.INVALID_LOGON_HOURS: (UserStatus.LOGON_RESTRICTED, "Outside allowed logon hours"),
+    AuthStatus.MACHINE_ACCOUNT: (UserStatus.PASSWORD_FOUND, "Machine account"),
+}
 
 
 @dataclass
-class WorkItem:
-    """Work item containing a user and password to test."""
+class WorkerContext:
+    """Settings and shared objects common to all workers."""
 
-    user: User
-    password: str
+    console: Console
+    domain: str
+    pdc_ip: str
+    time_delta: timedelta
+    stop_event: threading.Event
+    lockout_event: threading.Event
+    database_service: DatabaseService | None = None
+    debug: bool = False
 
 
 class Worker(threading.Thread):
     """
-    Worker thread for password spraying with proper anti-lockout protection.
+    Worker thread for password spraying.
 
-    Key safety features:
-    - Acquires user lock BEFORE checking if password can be tested
-    - All state checks happen while holding the lock
-    - Proper error handling and cleanup
+    For each (user, password) handed out by the scheduler:
+    1. read the user's lockout state on the PDC (single BASE search)
+    2. give the user back with a delay if an attempt is not safe yet
+    3. authenticate against the PDC, so that only the PDC counter moves
+    4. read the state again to know if the failure was counted: a failure that
+       leaves badPasswordTime untouched means the password is one of the two
+       previous ones (N-1 / N-2)
     """
 
     def __init__(
         self,
         worker_id: int,
-        work_queue: queue.Queue,
+        scheduler: Scheduler,
         ldap_service: LdapService | None,
         smb_service: SmbService,
-        console: Console,
-        online_mode: bool,
-        stop_event: threading.Event,
-        lockout_event: threading.Event,
-        database_service: DatabaseService | None = None,
-        completed_count_ref: tuple = None,
-        connected_workers_ref: tuple = None,
-        debug: bool = False
+        context: WorkerContext,
+        on_connected: Callable[[bool], None],
     ):
         super().__init__(daemon=True)
         self.worker_id = worker_id
-        self.work_queue = work_queue
+        self.scheduler = scheduler
         self.ldap_service = ldap_service
         self.smb_service = smb_service
-        self.database_service = database_service
-        self.console = console
-        self.online_mode = online_mode
-        self.stop_event = stop_event
-        self.lockout_event = lockout_event
-        self.debug = debug
+        self.ctx = context
+        self.console = context.console
+        self.on_connected = on_connected
 
-        # Progress tracking
-        if completed_count_ref:
-            self.orchestrator, self.count_attr, self.lock_attr = completed_count_ref
-        else:
-            self.orchestrator = None
-
-        # Connection tracking
-        if connected_workers_ref:
-            self.conn_orchestrator, self.conn_count_attr, self.conn_lock_attr = connected_workers_ref
-        else:
-            self.conn_orchestrator = None
+    def _debug(self, message: str) -> None:
+        if self.ctx.debug:
+            self.console.print(f"[blue]Worker {self.worker_id}: {message}[/blue]")
 
     def run(self) -> None:
-        """Main worker loop - process work items from queue."""
-        # Connect services
+        """Main worker loop."""
         try:
-            if self.online_mode and self.ldap_service:
+            if self.ldap_service:
                 self.ldap_service.connect()
             self.smb_service.connect()
         except Exception as e:
             self.console.print(f"[red]Worker {self.worker_id} failed to connect: {e}[/red]")
+            self.on_connected(False)
             return
+        self.on_connected(True)
 
-        # Increment connected workers counter
-        if self.conn_orchestrator:
-            lock = getattr(self.conn_orchestrator, self.conn_lock_attr)
-            with lock:
-                current = getattr(self.conn_orchestrator, self.conn_count_attr)
-                setattr(self.conn_orchestrator, self.conn_count_attr, current + 1)
-
-        # Process work items
-        while not self.stop_event.is_set() and not self.lockout_event.is_set():
-            try:
-                # Get work item with timeout
-                work_item = self.work_queue.get(timeout=0.1)
-            except queue.Empty:
+        while not self.ctx.stop_event.is_set() and not self.ctx.lockout_event.is_set():
+            item = self.scheduler.acquire(timeout=0.5)
+            if item is None:
                 continue
-
+            user, password = item
+            delay, consumed = ERROR_RETRY_DELAY, False
             try:
-                self._process_work_item(work_item)
+                delay, consumed = self._process(user, password)
             except UserLockedOutError:
-                # Signal all workers to stop
-                self.lockout_event.set()
-                break
-            except SmbConnectionError:
-                # Signal all workers to stop
-                self.stop_event.set()
-                break
+                self.ctx.lockout_event.set()
+                self.scheduler.close()
+            except SmbConnectionError as e:
+                self.console.print(f"[red]Worker {self.worker_id}: {e}[/red]")
+                self.ctx.stop_event.set()
             except Exception as e:
-                self.console.print(f"[red]Worker {self.worker_id} error: {e}[/red]")
+                self.console.print(f"[red]Worker {self.worker_id} error on {user.samaccountname}: {e}[/red]")
             finally:
-                self.work_queue.task_done()
-                # Small delay to avoid hammering the DC
-                time.sleep(0.1)
+                self.scheduler.release(user, delay, consumed)
 
-    def _process_work_item(self, work_item: WorkItem) -> None:
+    # ----- one attempt -----
+
+    def _process(self, user: User, password: str) -> tuple[float, bool]:
         """
-        Process a single work item (test password for user).
+        Test one password on one user if it is safe.
 
-        CRITICAL: This method implements the thread-safe anti-lockout logic.
+        Returns:
+            (delay before the user can be handed out again, password consumed)
+        """
+        if not self._refresh(user):
+            return 0, False
 
-        Flow:
-        1. Try to acquire user lock (non-blocking)
-        2. If can't acquire, requeue and return
-        3. While holding lock:
-           a. Update from LDAP (if online)
-           b. Check if can test password
-           c. If need to wait, requeue and return
-           d. Test password
-           e. Update user state
+        now = dc_now(self.ctx.time_delta)
+        wait = (user.next_attempt_time(now) - now).total_seconds()
+        if wait > 0:
+            self._debug(f"{user.samaccountname} must wait {wait:.0f}s "
+                        f"(effective badPwdCount={user.effective_bad_count(now)})")
+            return wait, False
 
-        Args:
-            work_item: WorkItem containing user and password to test
+        if self.ctx.lockout_event.is_set() or self.ctx.stop_event.is_set():
+            return 0, False
+
+        before = user.state
+        self._debug(f"testing {user.samaccountname} / {password}")
+        try:
+            status = self.smb_service.test_credentials(user.samaccountname, password)
+        except AuthAttemptLostError as e:
+            self._debug(str(e))
+            return 0, self._handle_lost_attempt(user, password, before)
+        except UserLockedOutError:
+            self._dump_lockout(user, password, "SMB_AUTH_RESPONSE")
+            raise
+
+        if status.is_success:
+            self._handle_success(user, password, status)
+        elif status == AuthStatus.ACCOUNT_RESTRICTION:
+            self._handle_restricted(user, password)
+        else:
+            self._handle_failure(user, password, status, before)
+        return 0, True
+
+    def _refresh(self, user: User) -> bool:
+        """Read the user's state on the PDC. False if the user must be dropped."""
+        if not self.ldap_service:
+            return True
+        state = self.ldap_service.read_user_state(user.dn)
+        if state is None or state.disabled:
+            self.console.print(f"[bright_black]{user.samaccountname} is disabled or gone - DISCARDING[/bright_black]")
+            user.status = UserStatus.ACCOUNT_DISABLED
+            user.finished = True
+            return False
+        user.apply_state(state)
+        return True
+
+    def _was_counted(self, user: User, before: LockoutState) -> bool:
+        """
+        Tell whether the DC counted our failed attempt, by comparing badPasswordTime.
+
+        A user's successful logon resets badPwdCount but not badPasswordTime, so an
+        unchanged badPasswordTime can only mean that our failure was not counted.
+        Without LDAP access, every failure is assumed counted.
 
         Raises:
-            UserLockedOutError: If user gets locked out
-            SmbConnectionError: If SMB connection fails
-        """
-        user = work_item.user
-        password = work_item.password
-
-        # CRITICAL: Try to acquire lock (non-blocking to avoid deadlock)
-        # If we can't get the lock, another worker is testing this user
-        if not user.try_acquire_lock(blocking=False):
-            # Can't acquire lock - requeue for later
-            if self.debug:
-                self.console.print(f"[magenta]🔒 Worker {self.worker_id}: Lock busy for {user.samaccountname}/{password} - REQUEUE[/magenta]")
-            self.work_queue.put(work_item)
-            return
-
-        try:
-            # Now we hold the lock - safe to check and modify state
-            if self.debug:
-                self.console.print(f"[cyan]✓ Worker {self.worker_id}: Lock acquired for {user.samaccountname}/{password}[/cyan]")
-
-            # Update user's bad password info from LDAP (if online)
-            if self.online_mode and self.ldap_service:
-                self._update_user_from_ldap(user)
-
-            # Check if we can test this password
-            can_test, reason = user.can_test_password(password)
-            remaining = user.get_remaining_attempts()
-            bad_count = user.get_bad_password_count()
-
-            if self.debug:
-                self.console.print(
-                    f"[blue]🔍 Worker {self.worker_id}: Check {user.samaccountname}/{password} - "
-                    f"can_test={can_test}, reason={reason}, bad_count={bad_count}, remaining={remaining}[/blue]"
-                )
-
-            if not can_test:
-                if reason == "no_remaining_attempts":
-                    # Check if we should wait for observation window
-                    wait_time = user.get_wait_time_for_next_attempt(password)
-                    if self.debug:
-                        self.console.print(
-                            f"[yellow]⏱️  Worker {self.worker_id}: No remaining attempts for {user.samaccountname}/{password} - "
-                            f"wait_time={wait_time:.1f}s[/yellow]"
-                        )
-                    if wait_time > 0:
-                        # Requeue for later (after observation window)
-                        if self.debug:
-                            self.console.print(f"[yellow]↻ Worker {self.worker_id}: REQUEUE {user.samaccountname}/{password} (wait {wait_time:.1f}s)[/yellow]")
-                        self.work_queue.put(work_item)
-                        return
-                # Otherwise, skip this password (already tested, password found, etc.)
-                # Record in database if account is restricted to avoid retesting in future runs
-                if reason == "account_restricted" and self.database_service:
-                    try:
-                        self.database_service.record_test(user.samaccountname, password, False)
-                        if self.debug:
-                            self.console.print(f"[cyan]💾 Worker {self.worker_id}: Recorded restricted account {user.samaccountname}/{password} in DB[/cyan]")
-                    except Exception as e:
-                        if self.debug:
-                            self.console.print(f"[red]⚠️  Worker {self.worker_id}: Failed to record restricted account in database: {e}[/red]")
-                # Increment completed count since we're not retrying this item
-                if self.debug:
-                    self.console.print(f"[yellow]⊘ Worker {self.worker_id}: SKIP {user.samaccountname}/{password} (reason: {reason})[/yellow]")
-                self._increment_completed()
-                return
-
-            # Test the password
-            if self.debug:
-                self.console.print(f"[green]🔑 Worker {self.worker_id}: TESTING {user.samaccountname}/{password}[/green]")
-
-            try:
-                status = self.smb_service.test_credentials(user.samaccountname, password)
-            except UserLockedOutError:
-                # Lockout detected during SMB auth - add comprehensive debug info
-                from datetime import datetime, timezone
-                current_dc_time = datetime.now(timezone.utc) - user.time_delta
-                obs_window_end = user.get_observation_window_end()
-                obs_window_passed = user.is_observation_window_passed(current_dc_time)
-                time_since_last_bad = (current_dc_time - user._bad_password_time).total_seconds()
-
-                # Query all DCs for badPwdCount and lockoutTime (online mode only)
-                dc_status_info = ""
-                if self.online_mode and self.ldap_service:
-                    dc_statuses = self.ldap_service.get_user_password_status_per_dc(user.samaccountname)
-                    if dc_statuses:
-                        dc_status_info = "\n[cyan]STATUS PER DC:[/cyan]\n"
-                        for dc_status in dc_statuses:
-                            dc_status_info += (
-                                f"  DC {dc_status['dc_ip']}:\n"
-                                f"    badPwdCount: {dc_status['bad_pwd_count']}\n"
-                                f"    badPasswordTime: {dc_status['bad_pwd_time'].isoformat()}\n"
-                                f"    lockoutTime: {dc_status['lockout_time'].isoformat()}\n"
-                            )
-
-                self.console.print(
-                    f"[red]═══════════════════════════════════════════════════════════[/red]\n"
-                    f"[red bold]LOCKOUT DETECTED - FULL DEBUG INFO[/red bold]\n"
-                    f"[red]═══════════════════════════════════════════════════════════[/red]\n"
-                    f"[yellow]Detection source:[/yellow] SMB_AUTH_RESPONSE\n"
-                    f"[yellow]Worker ID:[/yellow] {self.worker_id}\n"
-                    f"[yellow]Online mode:[/yellow] {self.online_mode}\n"
-                    f"\n"
-                    f"[cyan]USER STATE:[/cyan]\n"
-                    f"  Username: {user.samaccountname}\n"
-                    f"  DN: {user.dn}\n"
-                    f"  Bad password count (before test): {user._bad_password_count}\n"
-                    f"  Remaining attempts (calculated before test): {user.get_remaining_attempts()}\n"
-                    f"  Tested passwords count (before this test): {len(user._tested_passwords)}\n"
-                    f"  Tested passwords: {', '.join(user._tested_passwords[-5:])} "
-                    f"{'(showing last 5)' if len(user._tested_passwords) > 5 else ''}\n"
-                    f"  Current password being tested: {password}\n"
-                    f"  Found password: {user._found_password}\n"
-                    f"  Is restricted: {user._is_restricted}\n"
-                    f"  Status: {user._status.value}\n"
-                    f"\n"
-                    f"[cyan]PASSWORD POLICY:[/cyan]\n"
-                    f"  Policy name: {user.policy.name}\n"
-                    f"  Lockout threshold: {user.policy.lockout_threshold}\n"
-                    f"  Observation window (seconds): {user.policy.lockout_window_seconds}\n"
-                    f"  Allows spraying: {user.policy.allows_spraying}\n"
-                    f"\n"
-                    f"[cyan]CONFIGURATION:[/cyan]\n"
-                    f"  Security threshold: {user.security_threshold}\n"
-                    f"  Max allowed attempts: {user.policy.lockout_threshold - user.security_threshold}\n"
-                    f"\n"
-                    f"[cyan]TIMING:[/cyan]\n"
-                    f"  Current DC time: {current_dc_time.isoformat()}\n"
-                    f"  Last bad password time: {user._bad_password_time.isoformat()}\n"
-                    f"  Time since last bad password: {time_since_last_bad:.2f}s\n"
-                    f"  Observation window end: {obs_window_end.isoformat()}\n"
-                    f"  Observation window passed: {obs_window_passed}\n"
-                    f"  Time until window end: {(obs_window_end - current_dc_time).total_seconds():.2f}s\n"
-                    f"\n"
-                    f"[cyan]ANTI-LOCKOUT CHECKS (before this test):[/cyan]\n"
-                    f"  can_test_password() returned: {can_test}\n"
-                    f"  can_test reason: {reason}\n"
-                    f"  Remaining attempts reported: {remaining}\n"
-                    f"  Bad count before test: {bad_count}\n"
-                    f"  LDAP update performed: {self.online_mode}\n"
-                    f"{dc_status_info}"
-                    f"\n"
-                    f"[red]═══════════════════════════════════════════════════════════[/red]\n"
-                    f"[red bold]ANALYSIS:[/red bold]\n"
-                    f"  Expected max attempts: {user.policy.lockout_threshold - user.security_threshold}\n"
-                    f"  Actual tested count (before this): {len(user._tested_passwords)}\n"
-                    f"  Bad password count before this test: {user._bad_password_count}\n"
-                    f"  [red]This indicates a potential race condition or policy miscalculation![/red]\n"
-                    f"  [red]The SMB server reported account lockout status.[/red]\n"
-                    f"[red]═══════════════════════════════════════════════════════════[/red]"
-                )
-                # Re-raise to trigger worker shutdown
-                raise
-
-            # Convert AuthStatus to UserStatus
-            user_status = self._auth_status_to_user_status(status)
-
-            # Mark password as tested
-            success = status.is_success
-            user.mark_password_tested(password, success, user_status)
-
-            # Record in database if enabled
-            if self.database_service:
-                try:
-                    self.database_service.record_test(user.samaccountname, password, success)
-                except Exception as e:
-                    if self.debug:
-                        self.console.print(f"[red]⚠️  Worker {self.worker_id}: Failed to record test in database: {e}[/red]")
-
-            # Display result (while still holding lock to ensure consistent state)
-            if success:
-                if self.debug:
-                    self.console.print(f"[bold green]✓✓✓ Worker {self.worker_id}: SUCCESS {user.samaccountname}/{password}[/bold green]")
-                self._display_success(user, password, user_status)
-            else:
-                if self.debug:
-                    self.console.print(f"[red]✗ Worker {self.worker_id}: FAILED {user.samaccountname}/{password} - status={user_status.value}[/red]")
-                if user_status == UserStatus.ACCOUNT_RESTRICTED:
-                    # Account has restrictions - likely in Protected Users group
-                    self.console.print(
-                        f"[bright_black]Account {user.samaccountname} has restrictions "
-                        f"(likely Protected Users) - DISCARDING from further tests[/bright_black]"
-                    )
-                elif user_status == UserStatus.LOCKED_OUT:
-                    # CRITICAL: Capture full state for debugging
-                    from datetime import datetime, timezone
-                    current_dc_time = datetime.now(timezone.utc) - user.time_delta
-                    obs_window_end = user.get_observation_window_end()
-                    obs_window_passed = user.is_observation_window_passed(current_dc_time)
-                    time_since_last_bad = (current_dc_time - user._bad_password_time).total_seconds()
-
-                    # Query all DCs for badPwdCount and lockoutTime (online mode only)
-                    dc_status_info = ""
-                    if self.online_mode and self.ldap_service:
-                        dc_statuses = self.ldap_service.get_user_password_status_per_dc(user.samaccountname)
-                        if dc_statuses:
-                            dc_status_info = "\n[cyan]STATUS PER DC:[/cyan]\n"
-                            for dc_status in dc_statuses:
-                                dc_status_info += (
-                                    f"  DC {dc_status['dc_ip']}:\n"
-                                    f"    badPwdCount: {dc_status['bad_pwd_count']}\n"
-                                    f"    badPasswordTime: {dc_status['bad_pwd_time'].isoformat()}\n"
-                                    f"    lockoutTime: {dc_status['lockout_time'].isoformat()}\n"
-                                )
-
-                    self.console.print(
-                        f"[red]═══════════════════════════════════════════════════════════[/red]\n"
-                        f"[red bold]LOCKOUT DETECTED - FULL DEBUG INFO[/red bold]\n"
-                        f"[red]═══════════════════════════════════════════════════════════[/red]\n"
-                        f"[yellow]Detection source:[/yellow] LDAP_STATUS_UPDATE\n"
-                        f"[yellow]Worker ID:[/yellow] {self.worker_id}\n"
-                        f"[yellow]Online mode:[/yellow] {self.online_mode}\n"
-                        f"\n"
-                        f"[cyan]USER STATE:[/cyan]\n"
-                        f"  Username: {user.samaccountname}\n"
-                        f"  DN: {user.dn}\n"
-                        f"  Bad password count: {user._bad_password_count}\n"
-                        f"  Remaining attempts (calculated): {user.get_remaining_attempts()}\n"
-                        f"  Tested passwords count: {len(user._tested_passwords)}\n"
-                        f"  Tested passwords: {', '.join(user._tested_passwords[-5:])} "
-                        f"{'(showing last 5)' if len(user._tested_passwords) > 5 else ''}\n"
-                        f"  Current password being tested: {password}\n"
-                        f"  Found password: {user._found_password}\n"
-                        f"  Is restricted: {user._is_restricted}\n"
-                        f"  Status: {user._status.value}\n"
-                        f"\n"
-                        f"[cyan]PASSWORD POLICY:[/cyan]\n"
-                        f"  Policy name: {user.policy.name}\n"
-                        f"  Lockout threshold: {user.policy.lockout_threshold}\n"
-                        f"  Observation window (seconds): {user.policy.lockout_window_seconds}\n"
-                        f"  Allows spraying: {user.policy.allows_spraying}\n"
-                        f"\n"
-                        f"[cyan]CONFIGURATION:[/cyan]\n"
-                        f"  Security threshold: {user.security_threshold}\n"
-                        f"  Max allowed attempts: {user.policy.lockout_threshold - user.security_threshold}\n"
-                        f"\n"
-                        f"[cyan]TIMING:[/cyan]\n"
-                        f"  Current DC time: {current_dc_time.isoformat()}\n"
-                        f"  Last bad password time: {user._bad_password_time.isoformat()}\n"
-                        f"  Time since last bad password: {time_since_last_bad:.2f}s\n"
-                        f"  Observation window end: {obs_window_end.isoformat()}\n"
-                        f"  Observation window passed: {obs_window_passed}\n"
-                        f"  Time until window end: {(obs_window_end - current_dc_time).total_seconds():.2f}s\n"
-                        f"\n"
-                        f"[cyan]ANTI-LOCKOUT CHECKS (before this test):[/cyan]\n"
-                        f"  can_test_password() returned: {can_test}\n"
-                        f"  can_test reason: {reason}\n"
-                        f"  Remaining attempts reported: {remaining}\n"
-                        f"  Bad count before test: {bad_count}\n"
-                        f"{dc_status_info}"
-                        f"\n"
-                        f"[red]═══════════════════════════════════════════════════════════[/red]\n"
-                        f"[red bold]ANALYSIS:[/red bold]\n"
-                        f"  Expected max attempts: {user.policy.lockout_threshold - user.security_threshold}\n"
-                        f"  Actual tested count: {len(user._tested_passwords)}\n"
-                        f"  Bad password count at lockout: {user._bad_password_count}\n"
-                        f"  [red]This indicates a potential race condition or policy miscalculation![/red]\n"
-                        f"[red]═══════════════════════════════════════════════════════════[/red]"
-                    )
-                    # This will raise UserLockedOutError
-                    raise UserLockedOutError(user.samaccountname)
-
-            # Increment completed count since this item is done
-            self._increment_completed()
-
-        finally:
-            user.release_lock()
-
-    def _increment_completed(self) -> None:
-        """Increment the completed work items counter (thread-safe)."""
-        if self.orchestrator:
-            lock = getattr(self.orchestrator, self.lock_attr)
-            with lock:
-                current = getattr(self.orchestrator, self.count_attr)
-                setattr(self.orchestrator, self.count_attr, current + 1)
-
-    def _update_user_from_ldap(self, user: User) -> None:
-        """
-        Update user's bad password info and lockout status from LDAP.
-
-        MUST be called while holding the user lock.
+            UserLockedOutError: If our attempt locked the account out
         """
         if not self.ldap_service:
+            return True
+        try:
+            for delay in (0, UNCOUNTED_CONFIRM_DELAY):
+                time.sleep(delay)
+                after = self.ldap_service.read_user_state(user.dn)
+                if after is None:
+                    return True
+                user.apply_state(after)
+                if user.lockout_end(dc_now(self.ctx.time_delta)) is not None:
+                    self._dump_lockout(user, "", "LDAP_STATUS_AFTER_ATTEMPT")
+                    raise UserLockedOutError(user.samaccountname)
+                if after.bad_pwd_filetime != before.bad_pwd_filetime:
+                    return True
+        except UserLockedOutError:
+            raise
+        except Exception as e:
+            self._debug(f"post-attempt read failed for {user.samaccountname}: {e}")
+            return True
+        return False
+
+    # ----- outcomes -----
+
+    def _handle_failure(self, user: User, password: str, status: AuthStatus, before: LockoutState) -> None:
+        user.record_failure(dc_now(self.ctx.time_delta))
+        counted = self._was_counted(user, before)
+        if not counted:
+            user.cancel_last_failure()
+
+        note = None
+        if status == AuthStatus.UNKNOWN:
+            self.console.print(
+                f"[yellow]{user.samaccountname}: unexpected answer ({self.smb_service.last_error}), "
+                f"counted as a failed attempt[/yellow]"
+            )
+        elif not counted:
+            note = "previous"
+            user.status = UserStatus.PREVIOUS_PASSWORD
+            self.console.print(
+                f"[magenta]{user.samaccountname} - {password}[/magenta]"
+                f"[bright_black] (previous password: not counted by the DC)[/bright_black]"
+            )
+        else:
+            user.status = UserStatus.INVALID_PASSWORD
+        self._record(user, password, False, note)
+
+    def _handle_lost_attempt(self, user: User, password: str, before: LockoutState) -> bool:
+        """
+        The connection dropped mid-attempt. Never replay it blindly: account for it
+        first, then let the normal checks decide when to try again.
+
+        Returns:
+            True if the password is consumed (the DC counted it as a failure)
+        """
+        user.record_failure(dc_now(self.ctx.time_delta))
+        counted = self._was_counted(user, before)
+        if counted and self.ldap_service:
+            self._record(user, password, False, None)
+            return True
+        return False
+
+    def _handle_success(self, user: User, password: str, status: AuthStatus) -> None:
+        verdict = self._check_previous_password(user, password)
+        if verdict == KerberosVerdict.PREVIOUS:
+            user.status = UserStatus.PREVIOUS_PASSWORD
+            self.console.print(
+                f"[magenta]{user.samaccountname} - {password}[/magenta]"
+                f"[bright_black] (previous password, accepted by NTLM shortly after a change)[/bright_black]"
+            )
+            self._record(user, password, False, "previous")
             return
 
-        bad_pwd_count, bad_pwd_time, lockout_time = self.ldap_service.get_user_password_status(user.samaccountname)
-
-        # Update user state (always update to get latest lockout_time)
-        user.update_from_ldap(bad_pwd_count, bad_pwd_time, lockout_time)
-
-    def _auth_status_to_user_status(self, auth_status: AuthStatus) -> UserStatus:
-        """Convert AuthStatus to UserStatus."""
-        mapping = {
-            AuthStatus.SUCCESS: UserStatus.PASSWORD_FOUND,
-            AuthStatus.PASSWORD_EXPIRED: UserStatus.PASSWORD_EXPIRED,
-            AuthStatus.PASSWORD_MUST_CHANGE: UserStatus.PASSWORD_EXPIRED,
-            AuthStatus.ACCOUNT_EXPIRED: UserStatus.ACCOUNT_EXPIRED,
-            AuthStatus.ACCOUNT_RESTRICTION: UserStatus.ACCOUNT_RESTRICTED,
-            AuthStatus.INVALID_PASSWORD: UserStatus.INVALID_PASSWORD,
-            AuthStatus.ACCOUNT_LOCKOUT: UserStatus.LOCKED_OUT,
-            AuthStatus.INVALID_WORKSTATION: UserStatus.ACCOUNT_RESTRICTED,
-            AuthStatus.INVALID_LOGON_HOURS: UserStatus.ACCOUNT_RESTRICTED,
-        }
-        return mapping.get(auth_status, UserStatus.INVALID_PASSWORD)
-
-    def _display_success(self, user: User, password: str, status: UserStatus) -> None:
-        """
-        Display successful password find with appropriate message.
-
-        MUST be called while holding the user lock.
-        """
-        # Don't display restricted accounts
-        if status == UserStatus.ACCOUNT_RESTRICTED:
-            return
+        user.status, detail = SUCCESS_DISPLAY[status]
+        user.found_password = password
+        user.finished = True
+        note = None
+        if verdict == KerberosVerdict.UNKNOWN:
+            note = "unconfirmed"
+            detail = ", ".join(filter(None, [detail, "password changed recently, may be the previous one"]))
 
         message = f"[yellow]{user.samaccountname} - {password}[/yellow]"
-
-        if status == UserStatus.PASSWORD_EXPIRED:
-            message += "[bright_black] (Password expired or must be changed)[/bright_black]"
-        elif status == UserStatus.ACCOUNT_EXPIRED:
-            message += "[bright_black] (Account expired)[/bright_black]"
-
+        if detail:
+            message += f"[bright_black] ({detail})[/bright_black]"
         self.console.print(message)
+        self._record(user, password, True, note)
+
+    def _check_previous_password(self, user: User, password: str) -> KerberosVerdict:
+        """
+        NTLM network logons accept the previous password for a few minutes after a
+        change (OldPasswordAllowedPeriod). Double-check recent changes with Kerberos.
+        """
+        pwd_last_set = user.state.pwd_last_set
+        if user.has_lockout_info:
+            recent = pwd_last_set is not None and \
+                dc_now(self.ctx.time_delta) - pwd_last_set < OLD_PASSWORD_CHECK_PERIOD
+            if not recent:
+                return KerberosVerdict.CURRENT
+        verdict = verify_password(user.samaccountname, password, self.ctx.domain, self.ctx.pdc_ip)
+        self._debug(f"Kerberos check for {user.samaccountname}: {verdict.value}")
+        return verdict
+
+    def _handle_restricted(self, user: User, password: str) -> None:
+        user.status = UserStatus.ACCOUNT_RESTRICTED
+        user.finished = True
+        self.console.print(
+            f"[bright_black]Account {user.samaccountname} has restrictions "
+            f"(likely Protected Users) - DISCARDING from further tests[/bright_black]"
+        )
+        self._record(user, password, False, "restricted")
+
+    def _record(self, user: User, password: str, success: bool, note: str | None) -> None:
+        if not self.ctx.database_service:
+            return
+        try:
+            self.ctx.database_service.record_test(user.samaccountname, password, success, note)
+        except Exception as e:
+            self._debug(f"failed to record test in database: {e}")
+
+    # ----- diagnostics -----
+
+    def _dump_lockout(self, user: User, password: str, source: str) -> None:
+        """Print everything known about a user that got locked out."""
+        now = dc_now(self.ctx.time_delta)
+        per_dc = ""
+        if self.ldap_service and user.dn:
+            try:
+                for dc in self.ldap_service.get_user_status_per_dc(user.dn):
+                    state = dc['state']
+                    per_dc += (
+                        f"  DC {dc['dc_ip']}: badPwdCount={state.bad_pwd_count}, "
+                        f"badPasswordTime={state.bad_pwd_time}, lockoutTime={state.lockout_time}, "
+                        f"UF_LOCKOUT={state.locked}\n"
+                    )
+            except Exception as e:
+                per_dc = f"  (could not read per-DC status: {e})\n"
+
+        self.console.print(
+            f"[red bold]LOCKOUT DETECTED ({source}) - worker {self.worker_id}[/red bold]\n"
+            f"{user}\n"
+            f"  Password being tested: {password or '(after attempt)'}\n"
+            f"  Policy: {user.policy}\n"
+            f"  Security threshold: {user.security_threshold}\n"
+            f"  DC time: {now.isoformat()}\n"
+            f"[cyan]Status per DC (badPwdCount is not replicated):[/cyan]\n{per_dc}"
+            f"[red]Unlock with: Unlock-ADAccount -Identity {user.samaccountname}[/red]"
+        )

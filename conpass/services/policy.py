@@ -1,9 +1,16 @@
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from rich.console import Console
 
-from conpass.models import PasswordPolicy, User, UserStatus
-from conpass.services.ldap import LdapService
+from conpass.models import PasswordPolicy, User
+from conpass.services.ldap import (
+    LOCKOUT_ATTRIBUTES,
+    LdapService,
+    parse_lockout_state,
+    raw_attributes,
+    raw_str,
+)
+from conpass.utils import dc_now
 
 
 class PolicyService:
@@ -50,7 +57,7 @@ class PolicyService:
 
     def build_user_list(self, user_filter: list[str] | None = None) -> list[User]:
         """
-        Build list of users to spray based on policies.
+        Build list of enabled users to spray based on policies.
 
         Args:
             user_filter: Optional list of usernames to filter (only these users will be returned)
@@ -61,99 +68,72 @@ class PolicyService:
         if not self._default_policy:
             raise ValueError("Policies not loaded. Call load_policies() first.")
 
-        search_filter = "(&(objectClass=user)(!(sAMAccountName=*$)))"
-        attributes = [
-            'samAccountName',
-            'badPwdCount',
-            'badPasswordTime',
-            'lockoutTime',
-            'distinguishedName',
-            'msDS-ResultantPSO',
-            'userAccountControl'
-        ]
-
+        search_filter = (
+            "(&(objectCategory=person)(objectClass=user)(!(sAMAccountName=*$))"
+            "(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+        )
+        attributes = ['sAMAccountName', 'msDS-ResultantPSO', *LOCKOUT_ATTRIBUTES]
         entries = self.ldap_service.search_users(search_filter, attributes)
+
+        wanted = {name.lower() for name in user_filter} if user_filter else None
+        own_account = self.ldap_service.credentials.username.split('\\')[-1].lower()
+        skipped_unknown_pso: dict[str, int] = {}
         users = []
 
-        stats = {
-            'enabled': 0,
-            'disabled': 0,
-            'locked': 0,
-            'pso_users': {},
-            'discarded_low_threshold': 0,
-        }
-
         for entry in entries:
-            # Skip disabled accounts
-            if (entry.userAccountControl.value or 0) & 2:
-                stats['disabled'] += 1
+            raw = raw_attributes(entry)
+            samaccountname = raw_str(raw, 'sAMAccountName')
+            pso_dn = raw_str(raw, 'msDS-ResultantPSO')
+            pso_name = pso_dn.split(',')[0][3:] if pso_dn else None
+            if pso_name:
+                self._pso_user_counts[pso_name] = self._pso_user_counts.get(pso_name, 0) + 1
+
+            if not self._is_wanted(samaccountname, wanted, own_account):
                 continue
-
-            stats['enabled'] += 1
-
-            # Skip locked accounts
-            if (entry.userAccountControl.value or 0) & 16:
-                stats['locked'] += 1
-                continue
-
-            samaccountname = entry.samAccountName.value
-
-            # Track PSO users
-            pso_name = None
-            if entry['msDS-ResultantPSO']:
-                pso_name = entry['msDS-ResultantPSO'].value.split(',')[0][3:]
-                stats['pso_users'][pso_name] = stats['pso_users'].get(pso_name, 0) + 1
-
-                # Skip if we can't read PSO details
-                if not self.ldap_service.can_read_pso():
-                    continue
-
-            # Skip current user (the one running the tool)
-            if samaccountname.lower() == self.ldap_service.credentials.username.lower():
-                continue
-
-            # Apply user filter if provided
-            if user_filter and samaccountname not in user_filter:
-                continue
-
-            # Determine policy for this user
             policy = self._get_user_policy(pso_name)
-
-            # Skip users with low lockout threshold
-            if 0 < policy.lockout_threshold <= self.security_threshold:
-                if self.console:
-                    self.console.print(
-                        f"[yellow]{samaccountname} discarded: "
-                        f"Lockout threshold ({policy.lockout_threshold}) <= "
-                        f"security threshold ({self.security_threshold})[/yellow]"
-                    )
-                stats['discarded_low_threshold'] += 1
+            if policy is None:
+                # Never guess the policy of a PSO we cannot read: it may be stricter
+                skipped_unknown_pso[pso_name] = skipped_unknown_pso.get(pso_name, 0) + 1
+                continue
+            if self._threshold_too_low(samaccountname, policy):
                 continue
 
-            # Create user object
-            user = User(
+            users.append(User(
                 samaccountname=samaccountname,
-                dn=entry.distinguishedName.value,
+                dn=entry['dn'],
                 policy=policy,
-                bad_password_count=entry.badPwdCount.value if entry.badPwdCount.value is not None else 0,
-                bad_password_time=entry.badPasswordTime.value if entry.badPasswordTime.value else datetime(1970, 1, 1, tzinfo=timezone.utc),
-                time_delta=self.time_delta,
                 security_threshold=self.security_threshold,
-                lockout_time=entry.lockoutTime.value if entry.lockoutTime and entry.lockoutTime.value else datetime(1970, 1, 1, tzinfo=timezone.utc),
-            )
+                state=parse_lockout_state(raw),
+            ))
 
-            users.append(user)
-
-        # Store PSO user counts
-        self._pso_user_counts = stats['pso_users']
-
-        # Print statistics if console available
         if self.console:
-            self._print_user_stats(stats, users)
+            for pso_name, count in skipped_unknown_pso.items():
+                self.console.print(
+                    f"[yellow]{count} user(s) under PSO '{pso_name}' skipped: PSO details not readable[/yellow]"
+                )
+            self._print_user_stats(users)
 
         return users
 
-    def _get_user_policy(self, pso_name: str | None) -> PasswordPolicy:
+    @staticmethod
+    def _is_wanted(samaccountname: str | None, wanted: set[str] | None, own_account: str) -> bool:
+        # Authenticating with the sprayed account resets its counter: skip it
+        if not samaccountname or samaccountname.lower() == own_account:
+            return False
+        return wanted is None or samaccountname.lower() in wanted
+
+    def _threshold_too_low(self, samaccountname: str, policy: PasswordPolicy) -> bool:
+        if not 0 < policy.lockout_threshold <= self.security_threshold:
+            return False
+        if self.console:
+            self.console.print(
+                f"[yellow]{samaccountname} discarded: "
+                f"Lockout threshold ({policy.lockout_threshold}) <= "
+                f"security threshold ({self.security_threshold})[/yellow]"
+            )
+        return True
+
+    def _get_user_policy(self, pso_name: str | None) -> PasswordPolicy | None:
         """
         Get the password policy for a user.
 
@@ -161,31 +141,30 @@ class PolicyService:
             pso_name: Name of the PSO applied to the user (None for default policy)
 
         Returns:
-            PasswordPolicy object
+            PasswordPolicy object, None if the user's PSO is unknown
         """
-        if pso_name:
-            for pso in self._psos:
-                if pso.name == pso_name:
-                    return pso
-            if self.console:
-                self.console.print(f"[yellow]PSO '{pso_name}' not found, using default policy[/yellow]")
+        if not pso_name:
+            return self._default_policy
+        for pso in self._psos:
+            if pso.name == pso_name:
+                return pso
+        return None
 
-        return self._default_policy
-
-    def _print_user_stats(self, stats: dict, users: list[User]) -> None:
-        """Print user statistics to console."""
+    def _print_user_stats(self, users: list[User]) -> None:
+        """Print the distribution of effective bad password counts."""
         from rich.table import Table
 
-        # Bad password count distribution
-        badpwd_counts = {}
+        if not users:
+            return
+        now = dc_now(self.time_delta)
+        counts: dict[str, int] = {}
         for user in users:
-            count = user.get_bad_password_count()
-            badpwd_counts[count] = badpwd_counts.get(count, 0) + 1
+            key = 'locked out' if user.lockout_end(now) else str(user.effective_bad_count(now))
+            counts[key] = counts.get(key, 0) + 1
 
-        if badpwd_counts:
-            table = Table()
-            table.add_column('Bad Password Count')
-            table.add_column('Total Users')
-            for count in sorted(badpwd_counts.keys()):
-                table.add_row(str(count), str(badpwd_counts[count]))
-            self.console.print(table)
+        table = Table()
+        table.add_column('Effective Bad Password Count')
+        table.add_column('Total Users')
+        for key in sorted(counts, key=lambda k: (not k.isdigit(), int(k) if k.isdigit() else 0)):
+            table.add_row(key, str(counts[key]))
+        self.console.print(table)

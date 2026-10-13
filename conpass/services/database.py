@@ -60,9 +60,14 @@ class DatabaseService:
                 password TEXT NOT NULL,
                 success INTEGER NOT NULL,
                 timestamp TEXT NOT NULL,
+                note TEXT,
                 UNIQUE(username, password)
             )
         """)
+        # Databases created by older versions have no note column
+        columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({self.table_name})")}
+        if 'note' not in columns:
+            cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN note TEXT")
         # Create index for faster lookups
         cursor.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_{self.table_name}_username_password
@@ -117,7 +122,7 @@ class DatabaseService:
         result = cursor.fetchone()
         return bool(result[0]) if result else None
 
-    def record_test(self, username: str, password: str, success: bool) -> None:
+    def record_test(self, username: str, password: str, success: bool, note: str | None = None) -> None:
         """
         Record a tested credential combination.
         Updates both database and in-memory cache.
@@ -127,6 +132,7 @@ class DatabaseService:
             username: The tested username
             password: The tested password
             success: Whether the authentication was successful
+            note: Optional detail ('previous' for a previous password, 'restricted'...)
         """
         if not self._connection:
             return
@@ -142,15 +148,15 @@ class DatabaseService:
 
             try:
                 cursor.execute(
-                    f"INSERT INTO {self.table_name} (username, password, success, timestamp) VALUES (?, ?, ?, ?)",
-                    (username, password, int(success), timestamp)
+                    f"INSERT INTO {self.table_name} (username, password, success, timestamp, note) VALUES (?, ?, ?, ?, ?)",
+                    (username, password, int(success), timestamp, note)
                 )
                 self._connection.commit()
             except sqlite3.IntegrityError:
                 # Already exists, update it
                 cursor.execute(
-                    f"UPDATE {self.table_name} SET success = ?, timestamp = ? WHERE username = ? AND password = ?",
-                    (int(success), timestamp, username, password)
+                    f"UPDATE {self.table_name} SET success = ?, timestamp = ?, note = ? WHERE username = ? AND password = ?",
+                    (int(success), timestamp, note, username, password)
                 )
                 self._connection.commit()
 
@@ -180,6 +186,20 @@ class DatabaseService:
 
         cursor = self._connection.cursor()
         cursor.execute(f"SELECT username, password FROM {self.table_name} WHERE success = 1")
+        return [(row[0], row[1]) for row in cursor.fetchall()]
+
+    def get_previous_passwords(self) -> list[tuple[str, str]]:
+        """
+        Get passwords identified as previous passwords of their user (N-1 / N-2).
+
+        Returns:
+            List of tuples (username, password)
+        """
+        if not self._connection:
+            return []
+
+        cursor = self._connection.cursor()
+        cursor.execute(f"SELECT username, password FROM {self.table_name} WHERE note = 'previous'")
         return [(row[0], row[1]) for row in cursor.fetchall()]
 
     def get_stats(self) -> dict:

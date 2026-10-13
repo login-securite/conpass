@@ -1,14 +1,59 @@
 import socket
 import ssl
-from datetime import datetime, timezone
 
-from ldap3 import ALL, NTLM, Connection, Server, SUBTREE, BASE, Tls, TLS_CHANNEL_BINDING
-from ldap3.core.exceptions import LDAPBindError, LDAPSocketReceiveError
+from ldap3 import ALL, BASE, NONE, NTLM, SUBTREE, TLS_CHANNEL_BINDING, Connection, Server, Tls
+from ldap3.core.exceptions import LDAPBindError, LDAPException
 from rich.console import Console
 
-from conpass.exceptions import LdapConnectionError, PdcNotFoundError
-from conpass.models import Credentials, PasswordPolicy
-from conpass.utils import resolve_hostname, parse_hashes, format_hash_for_ldap
+from conpass.exceptions import LdapConnectionError
+from conpass.models import Credentials, LockoutState, PasswordPolicy
+from conpass.utils import filetime_to_datetime, find_pdc_hostname, format_hash_for_ldap, parse_hashes, resolve_hostname
+
+UF_ACCOUNTDISABLE = 0x2
+UF_LOCKOUT = 0x10
+
+LOCKOUT_ATTRIBUTES = [
+    'badPwdCount',
+    'badPasswordTime',
+    'lockoutTime',
+    'pwdLastSet',
+    'userAccountControl',
+    'msDS-User-Account-Control-Computed',
+]
+
+
+def raw_attributes(response_entry: dict) -> dict[str, list[bytes]]:
+    """Raw attribute values of a search result entry, keyed by lowercase name."""
+    return {k.lower(): v for k, v in response_entry.get('raw_attributes', {}).items()}
+
+
+def raw_int(raw: dict[str, list[bytes]], attribute: str) -> int:
+    values = raw.get(attribute.lower())
+    return int(values[0]) if values else 0
+
+
+def raw_str(raw: dict[str, list[bytes]], attribute: str) -> str | None:
+    values = raw.get(attribute.lower())
+    return values[0].decode('utf-8', errors='replace') if values else None
+
+
+def parse_lockout_state(raw: dict[str, list[bytes]]) -> LockoutState:
+    """
+    Build a LockoutState from raw attributes.
+
+    Raw values are parsed directly so that no schema is needed and badPasswordTime
+    keeps its exact FILETIME value.
+    """
+    bad_pwd_filetime = raw_int(raw, 'badPasswordTime')
+    return LockoutState(
+        bad_pwd_count=raw_int(raw, 'badPwdCount'),
+        bad_pwd_filetime=bad_pwd_filetime,
+        bad_pwd_time=filetime_to_datetime(bad_pwd_filetime),
+        lockout_time=filetime_to_datetime(raw_int(raw, 'lockoutTime')),
+        locked=bool(raw_int(raw, 'msDS-User-Account-Control-Computed') & UF_LOCKOUT),
+        pwd_last_set=filetime_to_datetime(raw_int(raw, 'pwdLastSet')),
+        disabled=bool(raw_int(raw, 'userAccountControl') & UF_ACCOUNTDISABLE),
+    )
 
 
 class LdapService:
@@ -24,7 +69,8 @@ class LdapService:
         timeout: int = 3,
         dns_ip: str | None = None,
         console: Console | None = None,
-        debug: bool = False
+        debug: bool = False,
+        fetch_schema: bool = True,
     ):
         self.credentials = credentials
         self.base_dn = base_dn
@@ -38,131 +84,50 @@ class LdapService:
         self.dns_ip = dns_ip if dns_ip else dc_ip
         self.console = console
         self.debug = debug
+        # The schema is only needed to format policy attributes; workers only read
+        # raw values, so they skip downloading it.
+        self.fetch_schema = fetch_schema
 
-        self._connections: list[Connection] = []
-        self._all_dc_ips: list[str] = []
+        self._connection: Connection | None = None
         self._can_read_psos = False
-        self._pdc_dc_ip: str | None = None
-        self._pdc_discovered: bool = False
-        self._pdc_fqdn: str | None = None
+
+    def _debug(self, message: str) -> None:
+        if self.debug and self.console:
+            self.console.print(f"[cyan][DEBUG] {message}[/cyan]")
 
     def connect(self) -> None:
         """
-        Connect to the PDC Emulator domain controller only.
+        Connect to the configured domain controller.
 
         Raises:
-            LdapConnectionError: If unable to connect to any DC
+            LdapConnectionError: If unable to connect
         """
-        from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn
+        self._debug(f"Connecting to {self.dc_ip} via LDAP (timeout={self.timeout}s)")
+        self._connection = self._create_connection(self.dc_ip)
+        if not self._connection:
+            raise LdapConnectionError(f"Could not connect to {self.dc_ip} via LDAP")
 
-        if not self._all_dc_ips:
-            if self.debug and self.console:
-                self.console.print(f"[cyan][DEBUG] Discovering domain controllers from {self.dc_ip}[/cyan]")
-            self._discover_domain_controllers()
-            if self.debug and self.console:
-                self.console.print(f"[cyan][DEBUG] Discovered {len(self._all_dc_ips)} DC(s): {', '.join(self._all_dc_ips)}[/cyan]")
-
-        # Find PDC Emulator and use only that DC
-        self._pdc_dc_ip = self._find_pdc_emulator()
-        if self._pdc_dc_ip:
-            if self._pdc_discovered:
-                if self.console:
-                    label = f"{self._pdc_fqdn} ({self._pdc_dc_ip})" if self._pdc_fqdn else self._pdc_dc_ip
-                    self.console.print(f"[green]PDC Emulator identified: {label}[/green]")
-            else:
-                # Fell back to the provided DC: the PDC Emulator could not be
-                # identified, so badPwdCount may not be the authoritative value
-                # and the lockout risk is higher. Let the user decide whether to go on.
-                if self.console:
-                    self.console.print(
-                        f"[yellow]Warning: could not identify the PDC Emulator, falling back to {self._pdc_dc_ip}. "
-                        f"badPwdCount may be out of sync with the PDC, increasing the risk of account lockout.[/yellow]"
-                    )
-                if not self._confirm_continue_without_pdc():
-                    raise PdcNotFoundError(
-                        "Aborted: PDC Emulator could not be identified and the user chose not to continue."
-                    )
-            # Filter to only the PDC DC
-            pdc_ip = self._pdc_dc_ip
-            if pdc_ip not in self._all_dc_ips:
-                if self.debug and self.console:
-                    self.console.print(f"[cyan][DEBUG] PDC Emulator ({pdc_ip}) not in discovered DCs, using it anyway[/cyan]")
-                self._all_dc_ips = [pdc_ip]
-            else:
-                # Move PDC to first position
-                self._all_dc_ips = [pdc_ip] + [ip for ip in self._all_dc_ips if ip != pdc_ip]
-        else:
-            # PDC not found - raise to exit the tool
-            raise PdcNotFoundError(
-                f"PDC Emulator FSMO role holder not found. "
-                f"Cannot proceed without the PDC Emulator."
-            )
-
-        # Use progress bar if console is available
-        if self.console:
-            with Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                console=self.console,
-                transient=True
-            ) as progress:
-                task = progress.add_task("Connecting to PDC...", total=len(self._all_dc_ips))
-
-                for dc_ip in self._all_dc_ips:
-                    if self.debug:
-                        self.console.print(f"[cyan][DEBUG] Attempting connection to DC: {dc_ip} (timeout={self.timeout}s)[/cyan]")
-                    conn = self._create_connection(dc_ip)
-                    if conn and self.debug:
-                        self.console.print(f"[cyan][DEBUG] Successfully connected to DC: {dc_ip}[/cyan]")
-                    elif not conn and self.debug:
-                        self.console.print(f"[cyan][DEBUG] Failed to connect to DC: {dc_ip}[/cyan]")
-                    self._connections.append(conn)
-                    progress.update(task, advance=1)
-        else:
-            # No console - connect without progress bar
-            for dc_ip in self._all_dc_ips:
-                conn = self._create_connection(dc_ip)
-                self._connections.append(conn)
-
-        # Check if we have at least one successful connection
-        if not any(self._connections):
-            raise LdapConnectionError("Could not connect to the PDC Emulator")
-
-        # Filter out failed connections
-        if not all(self._connections):
-            failed_dcs = [
-                dc_ip for dc_ip, conn in zip(self._all_dc_ips, self._connections) if not conn
-            ]
-            if self.console:
-                self.console.print(
-                    f"[yellow]Could not bind to some Domain Controllers (Failed for {', '.join(failed_dcs)})[/yellow]"
-                )
-            self._all_dc_ips = [dc_ip for dc_ip, conn in zip(self._all_dc_ips, self._connections) if conn]
-            self._connections = [conn for conn in self._connections if conn]
-
-    def _confirm_continue_without_pdc(self) -> bool:
-        """
-        Ask the user whether to continue when the PDC Emulator could not be identified.
-
-        Returns True to continue (or when no console is available to prompt),
-        False if the user declines.
-        """
-        if not self.console:
-            return True
-        from rich.prompt import Confirm
-        return Confirm.ask(
-            "[yellow]Continue anyway despite the higher lockout risk?[/yellow]",
-            console=self.console,
-            default=False,
-        )
+    def close(self) -> None:
+        if self._connection:
+            try:
+                self._connection.unbind()
+            except Exception:
+                pass
+        self._connection = None
 
     def _create_ldap_server(self, dc_ip: str, use_ssl: bool) -> Server:
         """Create an LDAP server object."""
+        get_info = ALL if self.fetch_schema else NONE
         if use_ssl:
             tls = Tls(validate=ssl.CERT_NONE)
-            return Server(dc_ip, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=self.timeout)
-        return Server(dc_ip, get_info=ALL, connect_timeout=self.timeout)
+            return Server(dc_ip, use_ssl=True, tls=tls, get_info=get_info, connect_timeout=self.timeout)
+        return Server(dc_ip, get_info=get_info, connect_timeout=self.timeout)
+
+    def _bind_password(self) -> str:
+        if self.credentials.has_hash:
+            lm_hash, nt_hash = parse_hashes(self.credentials.hashes)
+            return format_hash_for_ldap(lm_hash, nt_hash)
+        return self.credentials.password
 
     def _create_connection(self, dc_ip: str) -> Connection | None:
         """
@@ -174,22 +139,12 @@ class LdapService:
         Returns:
             Connection object if successful, None otherwise
         """
-        # Determine the password to use (cleartext or hash)
-        if self.credentials.has_hash:
-            # Parse and format hash for LDAP3
-            lm_hash, nt_hash = parse_hashes(self.credentials.hashes)
-            password = format_hash_for_ldap(lm_hash, nt_hash)
-        else:
-            password = self.credentials.password
-
+        password = self._bind_password()
         try:
-            # Try with SSL and channel binding first
             try:
-                if self.debug and self.console:
-                    self.console.print(f"[cyan][DEBUG] Trying SSL connection with channel binding to {dc_ip}[/cyan]")
-                server = self._create_ldap_server(dc_ip, True)
+                self._debug(f"Trying SSL connection with channel binding to {dc_ip}")
                 conn = Connection(
-                    server,
+                    self._create_ldap_server(dc_ip, True),
                     user=self.credentials.user_principal,
                     password=password,
                     authentication=NTLM,
@@ -199,142 +154,89 @@ class LdapService:
                 )
                 if not conn.bind():
                     raise LDAPBindError("Channel binding failed")
-                if self.debug and self.console:
-                    self.console.print(f"[cyan][DEBUG] SSL connection successful to {dc_ip}[/cyan]")
                 return conn
             except (ssl.SSLError, socket.error, LDAPBindError) as e:
-                # Fall back to non-SSL
-                if self.debug and self.console:
-                    self.console.print(f"[cyan][DEBUG] SSL failed for {dc_ip} ({type(e).__name__}), trying non-SSL[/cyan]")
-                server = self._create_ldap_server(dc_ip, False)
+                self._debug(f"SSL failed for {dc_ip} ({type(e).__name__}), trying non-SSL")
                 conn = Connection(
-                    server,
+                    self._create_ldap_server(dc_ip, False),
                     user=self.credentials.user_principal,
                     password=password,
                     authentication=NTLM,
+                    auto_referrals=False,
                     receive_timeout=self.timeout,
                 )
-                if conn.bind():
-                    if self.debug and self.console:
-                        self.console.print(f"[cyan][DEBUG] Non-SSL connection successful to {dc_ip}[/cyan]")
-                    return conn
-                return None
+                return conn if conn.bind() else None
         except Exception as e:
-            if self.debug and self.console:
-                self.console.print(f"[cyan][DEBUG] Connection failed to {dc_ip}: {type(e).__name__}[/cyan]")
+            self._debug(f"Connection failed to {dc_ip}: {type(e).__name__}")
             return None
 
-    def _find_pdc_emulator(self) -> str | None:
+    def find_pdc_emulator(self) -> tuple[str | None, str | None]:
         """
-        Find the IP address of the Domain Controller holding the PDC Emulator FSMO role.
+        Find the Domain Controller holding the PDC Emulator FSMO role.
 
-        Reads the fSMORoleOwner attribute on the domain naming context root. That DN
-        points to the NTDS Settings object of the role owner; its parent is the server
-        object, whose dNSHostName is resolved to an IP.
+        Reads fSMORoleOwner on the domain naming context root: it points to the NTDS
+        Settings object of the role owner, whose parent server object carries the
+        dNSHostName. Falls back to the _ldap._tcp.pdc._msdcs DNS SRV record.
 
         Returns:
-            PDC Emulator IP address string, or the provided DC IP as a fallback.
-            None only if no connection could be established.
+            (fqdn, ip), or (None, None) if the PDC could not be identified
         """
-        conn = self._create_connection(self.dc_ip)
-        if not conn:
-            if self.debug and self.console:
-                self.console.print("[yellow][DEBUG] Could not create connection for PDC detection[/yellow]")
-            return None
-
+        pdc_fqdn = None
         try:
-            conn.search(
-                search_base=self.base_dn,
-                search_filter="(objectClass=domainDNS)",
-                search_scope=BASE,
-                attributes=['fSMORoleOwner']
-            )
-
-            owner_dn = None
-            if conn.entries and conn.entries[0].fSMORoleOwner:
-                owner_dn = conn.entries[0].fSMORoleOwner.value
-
-            if owner_dn:
-                if self.debug and self.console:
-                    self.console.print(f"[cyan][DEBUG] PDC fSMORoleOwner DN: {owner_dn}[/cyan]")
-
-                # owner_dn = CN=NTDS Settings,CN=<SERVER>,CN=Servers,CN=<SITE>,...
-                # The server object is the parent of the NTDS Settings object.
-                server_dn = ','.join(owner_dn.split(',')[1:])
-
-                conn.search(
-                    search_base=server_dn,
-                    search_filter="(objectClass=server)",
-                    search_scope=BASE,
-                    attributes=['dNSHostName']
-                )
-
-                if conn.entries and conn.entries[0].dNSHostName:
-                    pdc_fqdn = conn.entries[0].dNSHostName.value
-                    pdc_ip = resolve_hostname(pdc_fqdn, self.dns_ip)
-                    if self.debug and self.console:
-                        self.console.print(f"[cyan][DEBUG] PDC Emulator: {pdc_fqdn} -> {pdc_ip}[/cyan]")
-                    self._pdc_discovered = True
-                    self._pdc_fqdn = pdc_fqdn
-                    return pdc_ip
-
-            # Could not determine the PDC from LDAP: fall back to the provided DC
-            if self.debug and self.console:
-                self.console.print(
-                    f"[yellow][DEBUG] Could not determine PDC Emulator from LDAP, "
-                    f"falling back to provided DC {self.dc_ip}[/yellow]"
-                )
-            return self.dc_ip
-
+            pdc_fqdn = self._find_pdc_fqdn_ldap()
         except Exception as e:
-            if self.debug and self.console:
-                self.console.print(
-                    f"[yellow][DEBUG] Error finding PDC Emulator ({type(e).__name__}: {e}), "
-                    f"falling back to provided DC {self.dc_ip}[/yellow]"
-                )
-            return self.dc_ip
-        finally:
-            try:
-                conn.unbind()
-            except Exception:
-                pass
+            self._debug(f"Error finding PDC Emulator via LDAP ({type(e).__name__}: {e})")
 
-    def _discover_domain_controllers(self) -> None:
-        """Discover all domain controllers via LDAP query."""
-        conn = self._create_connection(self.dc_ip)
-        if not conn:
-            raise LdapConnectionError(f"Could not connect to {self.dc_ip}")
+        if not pdc_fqdn:
+            domain = '.'.join(part.split('=')[1] for part in self.base_dn.split(','))
+            pdc_fqdn = find_pdc_hostname(domain, self.dns_ip)
+            self._debug(f"PDC Emulator from DNS SRV record: {pdc_fqdn}")
 
-        # Always include the initial DC first (it's the one we can reach)
-        self._all_dc_ips.append(self.dc_ip)
+        if not pdc_fqdn:
+            return None, None
+        try:
+            pdc_ip = resolve_hostname(pdc_fqdn, self.dns_ip)
+        except socket.gaierror as e:
+            self._debug(f"Could not resolve PDC Emulator {pdc_fqdn}: {e}")
+            return pdc_fqdn, None
+        self._debug(f"PDC Emulator: {pdc_fqdn} -> {pdc_ip}")
+        return pdc_fqdn, pdc_ip
 
-        search_filter = "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
-        attributes = ['dNSHostName']
+    def _find_pdc_fqdn_ldap(self) -> str | None:
+        conn = self._connection
+        conn.search(self.base_dn, "(objectClass=domainDNS)", search_scope=BASE, attributes=['fSMORoleOwner'])
+        if not conn.entries or not conn.entries[0].fSMORoleOwner:
+            return None
+        owner_dn = conn.entries[0].fSMORoleOwner.value
+        self._debug(f"PDC fSMORoleOwner DN: {owner_dn}")
 
-        conn.search(
-            search_base=self.base_dn,
-            search_filter=search_filter,
-            search_scope=SUBTREE,
-            attributes=attributes
-        )
-
-        for entry in conn.entries:
-            dns_name = entry.dNSHostName.value
-            if dns_name:
-                try:
-                    ip_address = resolve_hostname(dns_name, self.dns_ip)
-                    # Avoid duplicates - don't add if it's the same as the initial DC
-                    if ip_address != self.dc_ip and ip_address not in self._all_dc_ips:
-                        self._all_dc_ips.append(ip_address)
-                except socket.gaierror:
-                    pass
-
-        if not self._all_dc_ips:
-            raise LdapConnectionError("No domain controllers found")
+        # owner_dn = CN=NTDS Settings,CN=<SERVER>,CN=Servers,CN=<SITE>,...
+        server_dn = ','.join(owner_dn.split(',')[1:])
+        conn.search(server_dn, "(objectClass=server)", search_scope=BASE, attributes=['dNSHostName'])
+        if conn.entries and conn.entries[0].dNSHostName:
+            return conn.entries[0].dNSHostName.value
+        return None
 
     def get_dc_ips(self) -> list[str]:
-        """Get list of all domain controller IPs."""
-        return self._all_dc_ips
+        """Discover all domain controller IPs (connected DC first)."""
+        dc_ips = [self.dc_ip]
+        self._connection.search(
+            self.base_dn,
+            "(userAccountControl:1.2.840.113556.1.4.803:=8192)",
+            search_scope=SUBTREE,
+            attributes=['dNSHostName'],
+        )
+        for entry in self._connection.entries:
+            dns_name = entry.dNSHostName.value
+            if not dns_name:
+                continue
+            try:
+                ip_address = resolve_hostname(dns_name, self.dns_ip)
+            except socket.gaierror:
+                continue
+            if ip_address not in dc_ips:
+                dc_ips.append(ip_address)
+        return dc_ips
 
     def get_default_domain_policy(self) -> PasswordPolicy:
         """
@@ -343,17 +245,14 @@ class LdapService:
         Returns:
             PasswordPolicy object with default domain policy
         """
-        conn = self._connections[0]
-        search_filter = "(objectClass=domain)"
+        conn = self._connection
         attributes = [
             'lockoutThreshold', 'lockoutDuration', 'lockOutObservationWindow',
             'minPwdLength', 'pwdHistoryLength', 'maxPwdAge', 'minPwdAge', 'pwdProperties'
         ]
-
-        conn.search(self.base_dn, search_filter, search_scope=BASE, attributes=attributes)
+        conn.search(self.base_dn, "(objectClass=domain)", search_scope=BASE, attributes=attributes)
 
         if not conn.entries:
-            # Reconstruct domain name from base_dn for error message
             domain_name = '.'.join([part.split('=')[1] for part in self.base_dn.split(',') if part.startswith('dc=')])
             raise LdapConnectionError(
                 f"Could not find domain object at '{self.base_dn}'. "
@@ -365,52 +264,20 @@ class LdapService:
 
         entry = conn.entries[0]
 
-        lockout_threshold = entry.lockoutThreshold.value if entry.lockoutThreshold else 0
+        def seconds(attribute) -> int:
+            return int(abs(attribute.value.total_seconds())) if attribute else 0
 
-        # lockOutObservationWindow is a timedelta
-        if entry.lockOutObservationWindow:
-            lockout_window = int(abs(entry.lockOutObservationWindow.value.total_seconds()))
-        else:
-            lockout_window = 0
-
-        # lockoutDuration is a timedelta
-        if entry.lockoutDuration:
-            lockout_duration = int(abs(entry.lockoutDuration.value.total_seconds()))
-        else:
-            lockout_duration = 0
-
-        # minPwdLength
-        min_pwd_length = entry.minPwdLength.value if entry.minPwdLength else 0
-
-        # pwdHistoryLength
-        pwd_history_length = entry.pwdHistoryLength.value if entry.pwdHistoryLength else 0
-
-        # maxPwdAge is a timedelta (convert to days)
-        if entry.maxPwdAge:
-            max_pwd_age_days = int(abs(entry.maxPwdAge.value.total_seconds()) / 86400)
-        else:
-            max_pwd_age_days = 0
-
-        # minPwdAge is a timedelta (convert to days)
-        if entry.minPwdAge:
-            min_pwd_age_days = int(abs(entry.minPwdAge.value.total_seconds()) / 86400)
-        else:
-            min_pwd_age_days = 0
-
-        # pwdProperties bit flag (DOMAIN_PASSWORD_COMPLEX = 0x1)
         pwd_properties = entry.pwdProperties.value if entry.pwdProperties else 0
-        complexity_enabled = bool(pwd_properties & 0x1)
-
         return PasswordPolicy(
             name='Default Domain Policy',
-            lockout_threshold=lockout_threshold,
-            lockout_window_seconds=lockout_window,
-            lockout_duration_seconds=lockout_duration,
-            min_pwd_length=min_pwd_length,
-            pwd_history_length=pwd_history_length,
-            max_pwd_age_days=max_pwd_age_days,
-            min_pwd_age_days=min_pwd_age_days,
-            complexity_enabled=complexity_enabled
+            lockout_threshold=entry.lockoutThreshold.value if entry.lockoutThreshold else 0,
+            lockout_window_seconds=seconds(entry.lockOutObservationWindow),
+            lockout_duration_seconds=seconds(entry.lockoutDuration),
+            min_pwd_length=entry.minPwdLength.value if entry.minPwdLength else 0,
+            pwd_history_length=entry.pwdHistoryLength.value if entry.pwdHistoryLength else 0,
+            max_pwd_age_days=seconds(entry.maxPwdAge) // 86400,
+            min_pwd_age_days=seconds(entry.minPwdAge) // 86400,
+            complexity_enabled=bool(pwd_properties & 0x1),  # DOMAIN_PASSWORD_COMPLEX
         )
 
     def get_password_setting_objects(self) -> list[PasswordPolicy]:
@@ -420,9 +287,8 @@ class LdapService:
         Returns:
             List of PasswordPolicy objects for each PSO
         """
-        conn = self._connections[0]
+        conn = self._connection
         pso_base_dn = f"CN=Password Settings Container,CN=System,{self.base_dn}"
-        pso_filter = "(objectClass=msDS-PasswordSettings)"
         pso_attributes = [
             'name', 'msDS-LockoutThreshold', 'msDS-LockoutObservationWindow', 'msDS-LockoutDuration',
             'msDS-MinimumPasswordLength', 'msDS-PasswordHistoryLength',
@@ -430,122 +296,67 @@ class LdapService:
         ]
 
         try:
-            if not conn.search(pso_base_dn, pso_filter, attributes=pso_attributes):
+            if not conn.search(pso_base_dn, "(objectClass=msDS-PasswordSettings)", attributes=pso_attributes):
                 return []
         except Exception:
             return []
 
         self._can_read_psos = True
-
         if len(conn.entries) == 0:
             if self.console:
-                self.console.print("[yellow]No PSO found[/yellow]")
+                self.console.print(
+                    "[yellow]No PSO readable: either none exists, or this account cannot read them "
+                    "(users under a PSO are then skipped when msDS-ResultantPSO is visible).[/yellow]"
+                )
             return []
 
-        psos = []
-        for entry in conn.entries:
-            lockout_threshold = entry['msDS-LockoutThreshold'].value if entry['msDS-LockoutThreshold'] else 0
+        def value(entry, attribute, default=0):
+            return entry[attribute].value if entry[attribute] else default
 
-            # msDS-LockoutObservationWindow is a FILETIME (int), not timedelta
-            if entry['msDS-LockoutObservationWindow']:
-                lockout_window = int(-(entry['msDS-LockoutObservationWindow'].value / 10000000))
-            else:
-                lockout_window = 0
+        def seconds(entry, attribute) -> int:
+            # PSO time attributes are negative FILETIME intervals (int)
+            return int(-(value(entry, attribute) / 10000000))
 
-            # msDS-LockoutDuration is a FILETIME (int), not timedelta
-            if entry['msDS-LockoutDuration']:
-                lockout_duration = int(-(entry['msDS-LockoutDuration'].value / 10000000))
-            else:
-                lockout_duration = 0
-
-            # msDS-MinimumPasswordLength
-            min_pwd_length = entry['msDS-MinimumPasswordLength'].value if entry['msDS-MinimumPasswordLength'] else 0
-
-            # msDS-PasswordHistoryLength
-            pwd_history_length = entry['msDS-PasswordHistoryLength'].value if entry['msDS-PasswordHistoryLength'] else 0
-
-            # msDS-MaximumPasswordAge is a FILETIME (convert to days)
-            if entry['msDS-MaximumPasswordAge']:
-                max_pwd_age_days = int(-(entry['msDS-MaximumPasswordAge'].value / 10000000) / 86400)
-            else:
-                max_pwd_age_days = 0
-
-            # msDS-MinimumPasswordAge is a FILETIME (convert to days)
-            if entry['msDS-MinimumPasswordAge']:
-                min_pwd_age_days = int(-(entry['msDS-MinimumPasswordAge'].value / 10000000) / 86400)
-            else:
-                min_pwd_age_days = 0
-
-            # msDS-PasswordComplexityEnabled is a boolean
-            complexity_enabled = entry['msDS-PasswordComplexityEnabled'].value if entry['msDS-PasswordComplexityEnabled'] else False
-
-            psos.append(PasswordPolicy(
+        return [
+            PasswordPolicy(
                 name=entry.name.value if entry.name else "Unknown",
-                lockout_threshold=lockout_threshold,
-                lockout_window_seconds=lockout_window,
-                lockout_duration_seconds=lockout_duration,
-                min_pwd_length=min_pwd_length,
-                pwd_history_length=pwd_history_length,
-                max_pwd_age_days=max_pwd_age_days,
-                min_pwd_age_days=min_pwd_age_days,
-                complexity_enabled=complexity_enabled
-            ))
-
-        return psos
+                lockout_threshold=value(entry, 'msDS-LockoutThreshold'),
+                lockout_window_seconds=seconds(entry, 'msDS-LockoutObservationWindow'),
+                lockout_duration_seconds=seconds(entry, 'msDS-LockoutDuration'),
+                min_pwd_length=value(entry, 'msDS-MinimumPasswordLength'),
+                pwd_history_length=value(entry, 'msDS-PasswordHistoryLength'),
+                max_pwd_age_days=seconds(entry, 'msDS-MaximumPasswordAge') // 86400,
+                min_pwd_age_days=seconds(entry, 'msDS-MinimumPasswordAge') // 86400,
+                complexity_enabled=value(entry, 'msDS-PasswordComplexityEnabled', False),
+            )
+            for entry in conn.entries
+        ]
 
     def can_read_pso(self) -> bool:
         """Check if we have permission to read PSO details."""
         return self._can_read_psos
 
-    def search_users(self, search_filter: str, attributes: list[str]) -> list:
+    def search_users(self, search_filter: str, attributes: list[str]) -> list[dict]:
         """
-        Search for users on the PDC Emulator DC only.
-
-        Args:
-            search_filter: LDAP search filter
-            attributes: List of attributes to retrieve
+        Paged search on the connected DC.
 
         Returns:
-            List of LDAP entries from the PDC Emulator
+            List of search result entries (dicts with 'dn' and 'raw_attributes')
         """
         from rich.progress import Progress, SpinnerColumn, TextColumn
 
         entries = []
         cookie = None
+        conn = self._connection
 
-        # Only use the first connection (PDC Emulator)
-        conn = self._connections[0]
-
-        # Use spinner to show progress if console available
-        if self.console:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=self.console,
-                transient=True
-            ) as progress:
-                task = progress.add_task("Loading users from LDAP...", total=None)
-
-                while True:
-                    conn.search(
-                        self.base_dn,
-                        search_filter,
-                        attributes=attributes,
-                        paged_size=self.page_size,
-                        paged_cookie=cookie
-                    )
-
-                    for entry in conn.entries:
-                        entries.append(entry)
-
-                    # Update progress
-                    progress.update(task, description=f"Loading users from LDAP... {len(entries)} loaded")
-
-                    cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
-                    if not cookie:
-                        break
-        else:
-            # No console - load without progress display
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+            transient=True,
+            disable=self.console is None,
+        ) as progress:
+            task = progress.add_task("Loading users from LDAP...", total=None)
             while True:
                 conn.search(
                     self.base_dn,
@@ -554,9 +365,8 @@ class LdapService:
                     paged_size=self.page_size,
                     paged_cookie=cookie
                 )
-
-                for entry in conn.entries:
-                    entries.append(entry)
+                entries.extend(e for e in conn.response if e.get('type') == 'searchResEntry')
+                progress.update(task, description=f"Loading users from LDAP... {len(entries)} loaded")
 
                 cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
                 if not cookie:
@@ -567,73 +377,46 @@ class LdapService:
 
         return entries
 
-    def get_user_password_status(self, samaccountname: str) -> tuple[int, datetime, datetime]:
+    def read_user_state(self, dn: str) -> LockoutState | None:
         """
-        Get user's bad password count, time, and lockout time from all DCs (returns max).
-
-        Args:
-            samaccountname: User's SAM account name
+        Read the lockout state of a user with a single BASE search.
 
         Returns:
-            Tuple of (bad_password_count, bad_password_time, lockout_time)
+            LockoutState, or None if the object could not be read
         """
-        search_filter = f"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={samaccountname}))"
-        attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'lockoutTime']
-
-        entries = self.search_users(search_filter, attributes)
-
-        if not entries:
-            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-            return (0, epoch, epoch)
-
-        entry = entries[0]
-        bad_password_count = entry.badPwdCount.value if entry.badPwdCount.value is not None else 0
-        bad_password_time = entry.badPasswordTime.value if entry.badPasswordTime.value else datetime(1970, 1, 1, tzinfo=timezone.utc)
-        lockout_time = entry.lockoutTime.value if entry.lockoutTime and entry.lockoutTime.value else datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-        return (bad_password_count, bad_password_time, lockout_time)
-
-    def get_user_password_status_per_dc(self, samaccountname: str) -> list[dict]:
-        """
-        Get user's bad password count, lockout time, and bad password time from each DC individually.
-
-        Args:
-            samaccountname: User's SAM account name
-
-        Returns:
-            List of dicts with keys: dc_ip, bad_pwd_count, bad_pwd_time, lockout_time
-        """
-        search_filter = f"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={samaccountname}))"
-        attributes = ['samAccountName', 'badPwdCount', 'badPasswordTime', 'lockoutTime']
-
-        results = []
-        for dc_ip, conn in zip(self._all_dc_ips, self._connections):
-            if not conn:
-                continue
-
+        for attempt in range(2):
             try:
-                conn.search(
-                    self.base_dn,
-                    search_filter,
-                    attributes=attributes,
-                    search_scope=SUBTREE
-                )
+                self._connection.search(dn, "(objectClass=*)", search_scope=BASE, attributes=LOCKOUT_ATTRIBUTES)
+                break
+            except LDAPException:
+                if attempt:
+                    raise
+                self.connect()
 
-                if conn.entries:
-                    entry = conn.entries[0]
-                    bad_pwd_count = entry.badPwdCount.value if entry.badPwdCount.value is not None else 0
-                    bad_pwd_time = entry.badPasswordTime.value if entry.badPasswordTime.value else datetime(1970, 1, 1, tzinfo=timezone.utc)
-                    lockout_time = entry.lockoutTime.value if entry.lockoutTime and entry.lockoutTime.value else datetime(1970, 1, 1, tzinfo=timezone.utc)
+        for entry in self._connection.response:
+            if entry.get('type') == 'searchResEntry':
+                return parse_lockout_state(raw_attributes(entry))
+        return None
 
-                    results.append({
-                        'dc_ip': dc_ip,
-                        'bad_pwd_count': bad_pwd_count,
-                        'bad_pwd_time': bad_pwd_time,
-                        'lockout_time': lockout_time
-                    })
+    def get_user_status_per_dc(self, dn: str) -> list[dict]:
+        """
+        Read badPwdCount, badPasswordTime and lockoutTime of a user on every DC.
+
+        Debug helper: these attributes are not replicated, each DC has its own view.
+        """
+        results = []
+        for dc_ip in self.get_dc_ips():
+            dc_service = LdapService(
+                self.credentials, self.base_dn, dc_ip, self.use_ssl,
+                timeout=self.timeout, dns_ip=self.dns_ip, fetch_schema=False,
+            )
+            try:
+                dc_service.connect()
+                state = dc_service.read_user_state(dn)
             except Exception:
-                # If query fails on this DC, skip it
                 continue
-
+            finally:
+                dc_service.close()
+            if state:
+                results.append({'dc_ip': dc_ip, 'state': state})
         return results
-

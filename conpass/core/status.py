@@ -2,6 +2,20 @@
 
 from enum import Enum
 
+# NTSTATUS returned by msv1_0 only after the password was validated: the account
+# restrictions (SamIAccountRestrictions) are checked after the password test.
+_VALID_PASSWORD_STATUSES = {
+    'STATUS_PASSWORD_EXPIRED': 'PASSWORD_EXPIRED',
+    'STATUS_PASSWORD_MUST_CHANGE': 'PASSWORD_MUST_CHANGE',
+    'STATUS_ACCOUNT_EXPIRED': 'ACCOUNT_EXPIRED',
+    'STATUS_ACCOUNT_DISABLED': 'ACCOUNT_DISABLED',
+    'STATUS_INVALID_WORKSTATION': 'INVALID_WORKSTATION',
+    'STATUS_INVALID_LOGON_HOURS': 'INVALID_LOGON_HOURS',
+    'STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT': 'MACHINE_ACCOUNT',
+    'STATUS_NOLOGON_SERVER_TRUST_ACCOUNT': 'MACHINE_ACCOUNT',
+    'STATUS_NOLOGON_INTERDOMAIN_TRUST_ACCOUNT': 'MACHINE_ACCOUNT',
+}
+
 
 class AuthStatus(Enum):
     """Authentication status codes from SMB login attempts."""
@@ -10,12 +24,14 @@ class AuthStatus(Enum):
     PASSWORD_EXPIRED = "password_expired"
     PASSWORD_MUST_CHANGE = "password_must_change"
     ACCOUNT_EXPIRED = "account_expired"
-    INVALID_PASSWORD = "invalid_password"
-    SMB_CLOSED = "smb_closed"
-    ACCOUNT_LOCKOUT = "account_lockout"
-    ACCOUNT_RESTRICTION = "account_restriction"
+    ACCOUNT_DISABLED = "account_disabled"
     INVALID_WORKSTATION = "invalid_workstation"
     INVALID_LOGON_HOURS = "invalid_logon_hours"
+    MACHINE_ACCOUNT = "machine_account"
+    INVALID_PASSWORD = "invalid_password"
+    ACCOUNT_LOCKOUT = "account_lockout"
+    ACCOUNT_RESTRICTION = "account_restriction"
+    UNKNOWN = "unknown"
 
     @classmethod
     def from_exception(cls, exception: Exception) -> 'AuthStatus':
@@ -34,48 +50,34 @@ class AuthStatus(Enum):
         if 'STATUS_ACCOUNT_LOCKED_OUT' in error_str:
             return cls.ACCOUNT_LOCKOUT
 
-        # Password issues - These are "success" variants
-        if 'STATUS_PASSWORD_EXPIRED' in error_str:
-            return cls.PASSWORD_EXPIRED
-        if 'STATUS_PASSWORD_MUST_CHANGE' in error_str:
-            return cls.PASSWORD_MUST_CHANGE
+        for nt_status, name in _VALID_PASSWORD_STATUSES.items():
+            if nt_status in error_str:
+                return cls[name]
 
-        # Account issues
-        if 'STATUS_ACCOUNT_EXPIRED' in error_str:
-            return cls.ACCOUNT_EXPIRED
+        # Protected Users, blank password restriction...
         if 'STATUS_ACCOUNT_RESTRICTION' in error_str:
             return cls.ACCOUNT_RESTRICTION
 
-        # Logon restrictions
-        if 'STATUS_INVALID_WORKSTATION' in error_str:
-            return cls.INVALID_WORKSTATION
-        if 'STATUS_INVALID_LOGON_HOURS' in error_str:
-            return cls.INVALID_LOGON_HOURS
-        if 'STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT' in error_str:
-            return cls.ACCOUNT_RESTRICTION
-
-        # Invalid password
-        if 'STATUS_LOGON_FAILURE' in error_str:
+        if 'STATUS_LOGON_FAILURE' in error_str or 'STATUS_WRONG_PASSWORD' in error_str:
             return cls.INVALID_PASSWORD
 
-        # Connection issues
-        if any(msg in error_str for msg in ['Broken pipe', 'Connection reset by peer', 'Error occurs while reading from remote']):
-            return cls.SMB_CLOSED
-
-        # Default to invalid password for unknown errors
-        return cls.INVALID_PASSWORD
+        return cls.UNKNOWN
 
     @property
     def is_success(self) -> bool:
-        """Check if this status represents successful authentication."""
-        return self in (AuthStatus.SUCCESS, AuthStatus.PASSWORD_EXPIRED, AuthStatus.PASSWORD_MUST_CHANGE, AuthStatus.ACCOUNT_EXPIRED)
+        """Check if this status proves the password is valid."""
+        return self in (
+            AuthStatus.SUCCESS,
+            AuthStatus.PASSWORD_EXPIRED,
+            AuthStatus.PASSWORD_MUST_CHANGE,
+            AuthStatus.ACCOUNT_EXPIRED,
+            AuthStatus.ACCOUNT_DISABLED,
+            AuthStatus.INVALID_WORKSTATION,
+            AuthStatus.INVALID_LOGON_HOURS,
+            AuthStatus.MACHINE_ACCOUNT,
+        )
 
     @property
     def is_lockout(self) -> bool:
         """Check if this status represents account lockout."""
         return self == AuthStatus.ACCOUNT_LOCKOUT
-
-    @property
-    def is_fatal(self) -> bool:
-        """Check if this status should stop the spray operation."""
-        return self in (AuthStatus.ACCOUNT_LOCKOUT, AuthStatus.SMB_CLOSED)
