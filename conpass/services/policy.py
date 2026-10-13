@@ -111,7 +111,6 @@ class PolicyService:
                 self.console.print(
                     f"[yellow]{count} user(s) under PSO '{pso_name}' skipped: PSO details not readable[/yellow]"
                 )
-            self._print_user_stats(users)
 
         return users
 
@@ -150,11 +149,11 @@ class PolicyService:
                 return pso
         return None
 
-    def _print_user_stats(self, users: list[User]) -> None:
+    def print_user_stats(self, users: list[User]) -> None:
         """Print the distribution of effective bad password counts."""
         from rich.table import Table
 
-        if not users:
+        if not users or not self.console:
             return
         now = dc_now(self.time_delta)
         counts: dict[str, int] = {}

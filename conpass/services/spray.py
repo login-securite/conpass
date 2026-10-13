@@ -123,6 +123,8 @@ class SprayOrchestrator:
             self._gather_offline_mode()
 
         self._exclude_already_found()
+        if self.policy_service:
+            self.policy_service.print_user_stats(self.users)
         self.console.print(f"[bold green]Total sprayed users: {len(self.users)}[/bold green]")
 
     def _debug(self, message: str) -> None:
@@ -313,7 +315,7 @@ class SprayOrchestrator:
             # Can't read PSO details, just show names
             pso_user_counts = self.policy_service.get_pso_user_counts()
             for pso_name, count in pso_user_counts.items():
-                table.add_row(pso_name, 'N/A', 'N/A', str(count))
+                table.add_row(pso_name, *['N/A'] * 8, str(count))
 
         self.console.print(table)
 

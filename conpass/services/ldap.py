@@ -373,7 +373,7 @@ class LdapService:
                     break
 
         if self.console:
-            self.console.print(f"[green]✓ Loaded {len(entries)} users from LDAP")
+            self.console.print(f"[green]✓ Loaded {len(entries)} enabled users from LDAP")
 
         return entries
 
