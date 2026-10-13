@@ -6,7 +6,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from conpass.models import User
+from conpass.lockout import User
 
 
 class Scheduler:
@@ -24,6 +24,11 @@ class Scheduler:
     """
 
     def __init__(self, users: list[User], is_tested: Callable[[User, str], bool] | None = None):
+        """
+        Args:
+            users: Users to spray
+            is_tested: Tells whether a password was already tested on a user (previous session)
+        """
         self._cond = threading.Condition()
         self._is_tested = is_tested or (lambda _user, _password: False)
         self._passwords: list[str] = []
@@ -125,6 +130,7 @@ class Scheduler:
     # ----- state -----
 
     def progress(self) -> tuple[int, int]:
+        """(passwords done, passwords to test) over all users."""
         with self._cond:
             return self.completed, self.total
 
@@ -134,6 +140,7 @@ class Scheduler:
             return self._busy == 0 and not self._ready and not self._waiting
 
     def waiting_count(self) -> int:
+        """Number of users waiting for their observation window or lockout to end."""
         with self._cond:
             return len(self._waiting)
 

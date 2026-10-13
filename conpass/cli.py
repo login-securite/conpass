@@ -1,375 +1,275 @@
+"""Command line interface."""
+
 from pathlib import Path
+from typing import Annotated
 
 import typer
-from rich.console import Console
 
-from conpass.config import SprayConfig
-from conpass.exceptions import ConfigurationError
-from conpass.models import Credentials
-from conpass.services.spray import SprayOrchestrator
-from conpass.utils import get_logger, read_file_blocks
+from conpass import __version__
+from conpass.config import Credentials, SprayConfig
+from conpass.database import DEFAULT_DATABASE_PATH, Database
+from conpass.errors import ConfigurationError, ConpassError
+from conpass.lockout import PasswordPolicy
+from conpass.orchestrator import Orchestrator
+from conpass.output import console, error, set_debug, success, warning
+from conpass.report import print_found_credentials
+from conpass.targets import read_lines
 
+# Above this number of passwords, ask for confirmation: each password may take a full observation window
+LARGE_PASSWORD_FILE = 100
 
-def get_default_database_path() -> Path:
-    """Get the default database path in user's config directory."""
-    config_dir = Path.home() / ".config" / "conpass"
-    return config_dir / "conpass.db"
-
-app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
-
-
-def complete_path():
-    """Typer bug workaround: https://github.com/fastapi/typer/issues/951"""
-    return []
-
-
-@app.command(
-    help='Spray given passwords to all Active Directory users taking password policies into account',
+app = typer.Typer(
+    context_settings={"help_option_names": ["-h", "--help"]},
+    add_completion=False,
+    pretty_exceptions_enable=False,
 )
-def spray(
-    # Domain and authentication
-    domain: str = typer.Option(..., "--domain", "-d", help="Domain name (FQDN)", rich_help_panel="Authentication"),
-    username: str | None = typer.Option(None, "--username", "-u", help="Domain user. Use DOMAIN\\user to authenticate in a different domain than the target (-d), e.g. for cross-domain spraying", rich_help_panel="Authentication"),
-    password: str | None = typer.Option(None, "--password", "-p", help="Domain password", rich_help_panel="Authentication"),
-    hashes: str | None = typer.Option(None, "--hashes", "-H", help="NT hash(es) in format LM:NT, :NT or NT", rich_help_panel="Authentication"),
 
-    # Connection settings
-    dc_ip: str | None = typer.Option(None, "--dc-ip", "-D", help="Domain Controller IP address", rich_help_panel="Authentication"),
-    dc_host: str | None = typer.Option(None, "--dc-host", help="Hostname of the DC (default: --dc-ip or --domain)", rich_help_panel="Authentication"),
-    dns_ip: str | None = typer.Option(None, "--dns-ip", help="DNS server IP address for name resolution", rich_help_panel="Authentication"),
-    use_ssl: bool = typer.Option(False, "--use-ssl", help="Use LDAP over SSL/TLS (port 636)", rich_help_panel="Authentication"),
-
-    # Spray settings
-    password_file: Path | None = typer.Option(None, "--password-file", "-P", file_okay=True, resolve_path=True, help="File containing passwords to test", autocompletion=complete_path, rich_help_panel="Spray"),
-    user_file: Path | None = typer.Option(None, "--user-file", "-U", exists=True, file_okay=True, readable=True, resolve_path=True, help="File containing users to test", autocompletion=complete_path, rich_help_panel="Spray"),
-    database_path: Path | None = typer.Option(None, "--database", "-db", file_okay=True, resolve_path=True, help="SQLite database path to track tested credentials (default: ~/.config/conpass/conpass.db)", autocompletion=complete_path, rich_help_panel="Spray"),
-    user_as_pass: bool = typer.Option(False, "--user-as-pass", "-a", help="Enable user-as-pass for each user", rich_help_panel="Spray"),
-    security_threshold: int = typer.Option(2, "--security-threshold", "-s", min=1, help="Number of attempts kept unused below the lockout threshold (min 1)", rich_help_panel="Spray"),
-    disable_spray: bool = typer.Option(False, "--disable-spray", help="Disable password spraying (retrieve PSO details only)", rich_help_panel="Spray"),
-
-    # Manual policy (offline mode)
-    lockout_threshold: int | None = typer.Option(None, "--lockout-threshold", "-t", help="Manual lockout threshold (required with --user-file)", rich_help_panel="Spray"),
-    lockout_observation_window: int | None = typer.Option(None, "--lockout-observation-window", "-o", help="Manual lockout observation window in seconds (required with --user-file)", rich_help_panel="Spray"),
-
-    # Performance
-    max_threads: int = typer.Option(10, "--max-threads", "-m", help="Maximum number of threads", rich_help_panel="Spray"),
-    timeout: int = typer.Option(3, "--timeout", help="Connection timeout in seconds", rich_help_panel="Spray"),
-    limit_memory: bool = typer.Option(False, "--limit-memory", "-l", hidden=True, help="Deprecated, memory no longer grows with users x passwords", rich_help_panel="Spray"),
-
-    # Debug
-    debug: bool = typer.Option(False, "--debug", help="Enable debug messages", rich_help_panel="Spray"),
-
-    # Show credentials
-    show_found: bool = typer.Option(False, "--show", help="Show found credentials from database and exit", rich_help_panel="Spray"),
-):
-    """Password spraying tool for Active Directory."""
-    console = Console()
-    logger = get_logger(console)
-
-    # Handle --show option (display found credentials and exit)
-    if show_found:
-        _show_found_credentials(domain, database_path, console, logger)
-        return
-
-    # Validate inputs
-    try:
-        _validate_inputs(
-            domain=domain,
-            username=username,
-            password=password,
-            hashes=hashes,
-            user_file=user_file,
-            lockout_threshold=lockout_threshold,
-            lockout_observation_window=lockout_observation_window,
-            show_found=show_found,
-        )
-    except ConfigurationError as e:
-        logger.error(str(e))
-        raise typer.Exit(code=1) from None
-
-    # Ensure password file exists (create if needed)
-    if password_file:
-        try:
-            _ensure_password_file_exists(password_file, logger)
-        except ConfigurationError as e:
-            logger.error(str(e))
-            raise typer.Exit(code=1) from None
-
-    # Check password file size
-    if password_file:
-        _check_password_file_size(password_file, console)
-
-    # Setup database path (use default or user-provided, with confirmation)
-    try:
-        database_path = _setup_database_path(database_path, console)
-    except ConfigurationError as e:
-        logger.error(str(e))
-        raise typer.Exit(code=1) from None
-
-    # Build configuration
-    try:
-        config = SprayConfig(
-            domain=domain,
-            dc_ip=dc_ip,
-            dc_host=dc_host,
-            dns_ip=dns_ip,
-            use_ssl=use_ssl,
-            password_file=password_file,
-            user_file=user_file,
-            database_path=database_path,
-            user_as_pass=user_as_pass,
-            security_threshold=security_threshold,
-            disable_spray=disable_spray or (not password_file and not user_as_pass),
-            manual_lockout_threshold=lockout_threshold,
-            manual_lockout_observation_window=lockout_observation_window,
-            max_threads=max_threads,
-            timeout=timeout,
-            limit_memory=limit_memory,
-            debug=debug,
-        )
-    except ValueError as e:
-        logger.error(str(e))
-        raise typer.Exit(code=1) from None
-
-    # Build credentials (if provided)
-    credentials = None
-    if username:
-        try:
-            credentials = _build_credentials(username, domain, password, hashes)
-        except ValueError as e:
-            logger.error(str(e))
-            raise typer.Exit(code=1) from None
-
-    # Run spray
-    try:
-        orchestrator = SprayOrchestrator(config=config, credentials=credentials, console=console)
-        orchestrator.run()
-    except (ConfigurationError, Exception) as e:
-        # Import here to avoid circular imports
-        from conpass.exceptions import SmbConnectionError, LdapConnectionError, PdcNotFoundError
-
-        # For expected errors, just show the message without stack trace
-        if isinstance(e, (ConfigurationError, SmbConnectionError, LdapConnectionError, PdcNotFoundError)):
-            logger.error(str(e))
-            if isinstance(e, PdcNotFoundError):
-                raise typer.Exit(code=1) from None
-        else:
-            # For unexpected errors, show full stack trace
-            logger.critical(str(e))
-            console.print_exception()
-        raise typer.Exit(code=1) from None
+AUTH = "Authentication"
+TARGET = "Target"
+SPRAY = "Spraying"
+OFFLINE = "Offline mode (no LDAP access)"
 
 
-def _validate_inputs(
-    domain: str,
-    username: str | None,
-    password: str | None,
-    hashes: str | None,
-    user_file: Path | None,
-    lockout_threshold: int | None,
-    lockout_observation_window: int | None,
-    show_found: bool = False,
-) -> None:
-    """Validate CLI inputs."""
-    # Check domain format
-    if '.' not in domain:
-        raise ConfigurationError("Provide fully qualified domain name (e.g., domain.local instead of DOMAIN)")
-
-    # Skip other validations if we're just showing found credentials
-    if show_found:
-        return
-
-    # Check authentication requirements
-    if username is None and user_file is None:
-        raise ConfigurationError("Either --username or --user-file is required")
-
-    if username is not None and password is None and hashes is None:
-        raise ConfigurationError("Either --password or --hashes is required for authentication")
-
-    if password is not None and hashes is not None:
-        raise ConfigurationError("--password and --hashes are mutually exclusive")
-
-    # Check offline mode requirements
-    if username is None and user_file:
-        if not lockout_threshold or not lockout_observation_window:
-            raise ConfigurationError(
-                "When using --user-file without --username, "
-                "--lockout-threshold and --lockout-observation-window are required"
-            )
+def _version(value: bool) -> None:
+    if value:
+        console.print(f"conpass {__version__}")
+        raise typer.Exit
 
 
-def _ensure_password_file_exists(password_file: Path, logger) -> None:
-    """Ensure password file exists, create it if it doesn't."""
-    if not password_file.exists():
-        try:
-            # Create parent directories if needed
-            password_file.parent.mkdir(parents=True, exist_ok=True)
-            # Create empty file
-            password_file.touch()
-            logger.info(f"Created password file: {password_file}")
-        except PermissionError as e:
-            raise ConfigurationError(
-                f"Permission denied: Cannot create password file '{password_file}'"
-            ) from e
-        except OSError as e:
-            raise ConfigurationError(
-                f"Cannot create password file '{password_file}': {e}"
-            ) from e
-
-
-def _setup_database_path(database_path: Path | None, console: Console) -> Path | None:
-    """
-    Setup database path, using default if none provided.
-    Asks user confirmation if database doesn't exist.
-
-    Args:
-        database_path: User-provided database path (or None for default)
-        console: Console for user interaction
-
-    Returns:
-        Path to use for database, or None if user declined
-
-    Raises:
-        ConfigurationError: If unable to create database directory
-    """
-    # Use default path if none provided
-    if database_path is None:
-        database_path = get_default_database_path()
-
-    # If database already exists, use it
-    if database_path.exists():
-        return database_path
-
-    # Database doesn't exist - ask user
-    console.print(f"[yellow]Database does not exist: {database_path}[/yellow]")
-    console.print("[yellow]The database will track tested credentials and enable resume capability.[/yellow]")
-    response = console.input("Do you want to create it? \\[Y/n] ")
-
-    # Default to yes if user just presses enter
-    if not response or response.lower().startswith('y'):
-        try:
-            # Create parent directories
-            database_path.parent.mkdir(parents=True, exist_ok=True)
-            console.print(f"[green]✓ Database will be created at: {database_path}[/green]")
-            return database_path
-        except PermissionError as e:
-            raise ConfigurationError(
-                f"Permission denied: Cannot create database directory '{database_path.parent}'"
-            ) from e
-        except OSError as e:
-            raise ConfigurationError(
-                f"Cannot create database directory '{database_path.parent}': {e}"
-            ) from e
-    else:
-        console.print("[yellow]Database creation declined. Credentials will not be tracked.[/yellow]")
-        return None
-
-
-def _check_password_file_size(password_file: Path, console: Console) -> None:
-    """Check password file size and prompt if too large."""
-    with open(password_file) as f:
-        nb_passwords = sum(block.count("\n") for block in read_file_blocks(f))
-
-    if nb_passwords > 100:
-        response = console.input(
-            f"[yellow]The password file has {nb_passwords} passwords. "
-            f"It will take a very long time to try them all[/yellow]\n"
-            f"Do you want to continue? \\[y/N] "
-        )
-        if not response.lower().startswith('y'):
-            raise typer.Exit(code=1)
-
-
-def _show_found_credentials(
-    domain: str,
-    database_path: Path | None,
-    console: Console,
-    logger
+@app.command()
+def main(  # noqa: PLR0913, PLR0917 (one parameter per option)
+    domain: Annotated[str, typer.Option("--domain", "-d", help="Domain to spray (FQDN)", rich_help_panel=TARGET)],
+    username: Annotated[
+        str | None,
+        typer.Option(
+            "--username",
+            "-u",
+            help="Domain user, DOMAIN\\user to authenticate in another (trusted) domain",
+            rich_help_panel=AUTH,
+        ),
+    ] = None,
+    password: Annotated[
+        str | None, typer.Option("--password", "-p", help="Password of the domain user", rich_help_panel=AUTH)
+    ] = None,
+    hashes: Annotated[
+        str | None,
+        typer.Option("--hashes", "-H", help="NT hash of the domain user (LM:NT, :NT or NT)", rich_help_panel=AUTH),
+    ] = None,
+    dc_ip: Annotated[
+        str | None,
+        typer.Option(
+            "--dc-ip", "-D", help="Any domain controller, the PDC Emulator is found from there", rich_help_panel=TARGET
+        ),
+    ] = None,
+    dns_ip: Annotated[
+        str | None,
+        typer.Option("--dns-ip", help="DNS server (default: --dc-ip, or the system resolver)", rich_help_panel=TARGET),
+    ] = None,
+    use_ldaps: Annotated[
+        bool,
+        typer.Option(
+            "--ldaps",
+            "--use-ssl",
+            help="Only use LDAPS (default: LDAP with signing and sealing, then LDAPS)",
+            rich_help_panel=TARGET,
+        ),
+    ] = False,
+    password_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--password-file",
+            "-P",
+            help="Passwords to spray, one per line. The file is watched: passwords added later are sprayed too",
+            rich_help_panel=SPRAY,
+        ),
+    ] = None,
+    user_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--user-file",
+            "-U",
+            exists=True,
+            dir_okay=False,
+            help="Only spray these users, one per line",
+            rich_help_panel=SPRAY,
+        ),
+    ] = None,
+    user_as_pass: Annotated[
+        bool, typer.Option("--user-as-pass", "-a", help="Also try each username as password", rich_help_panel=SPRAY)
+    ] = False,
+    security_threshold: Annotated[
+        int,
+        typer.Option(
+            "--security-threshold",
+            "-s",
+            min=1,
+            help="Attempts always left unused below the lockout threshold",
+            rich_help_panel=SPRAY,
+        ),
+    ] = 2,
+    database_path: Annotated[
+        Path,
+        typer.Option(
+            "--database",
+            "-db",
+            dir_okay=False,
+            help="SQLite database of tested credentials, used to resume",
+            show_default="~/.config/conpass/conpass.db",
+            rich_help_panel=SPRAY,
+        ),
+    ] = DEFAULT_DATABASE_PATH,
+    disable_spray: Annotated[
+        bool, typer.Option("--disable-spray", help="Only display the policies and users", rich_help_panel=SPRAY)
+    ] = False,
+    threads: Annotated[
+        int, typer.Option("--max-threads", "-m", min=1, help="Number of parallel workers", rich_help_panel=SPRAY)
+    ] = 10,
+    timeout: Annotated[
+        int, typer.Option("--timeout", min=1, help="Network timeout in seconds", rich_help_panel=SPRAY)
+    ] = 5,
+    lockout_threshold: Annotated[
+        int | None,
+        typer.Option("--lockout-threshold", "-t", min=0, help="Lockout threshold to assume", rich_help_panel=OFFLINE),
+    ] = None,
+    lockout_window: Annotated[
+        int | None,
+        typer.Option(
+            "--lockout-observation-window",
+            "-o",
+            min=1,
+            help="Observation window to assume, in seconds",
+            rich_help_panel=OFFLINE,
+        ),
+    ] = None,
+    show: Annotated[bool, typer.Option("--show", help="Display the credentials found for the domain and exit")] = False,
+    debug: Annotated[bool, typer.Option("--debug", help="Display debug messages")] = False,
+    version: Annotated[
+        bool, typer.Option("--version", callback=_version, is_eager=True, help="Display the version and exit")
+    ] = False,
 ) -> None:
     """
-    Display found credentials from database and exit.
+    Spray passwords on all Active Directory users without locking them out.
 
-    Args:
-        domain: Domain name to query
-        database_path: Database path (or None for default)
-        console: Console for output
-        logger: Logger for errors
+    The policy of each user (domain policy or PSO) and its bad password count, read on the PDC Emulator, decide when the next password can be tried.
 
-    Raises:
-        typer.Exit: Always exits after displaying credentials
+    Without credentials (offline mode), give the users (-U) and the policy to assume (-t, -o).
     """
-    from rich.table import Table
-    from conpass.services.database import DatabaseService
+    options = locals().copy()
+    set_debug(debug)
+    try:
+        if "." not in domain:
+            msg = "The domain must be a FQDN (domain.local, not DOMAIN)"
+            raise ConfigurationError(msg)
+        if show:
+            _show(database_path, domain)
+            return
+        config = _build_config(options)
+        Orchestrator(config).run()
+    except ConpassError as e:
+        error(str(e))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        warning("Interrupted")
+        raise typer.Exit(130) from None
 
-    # Use default path if none provided
-    if database_path is None:
-        database_path = get_default_database_path()
 
-    # Check if database exists
+def _show(database_path: Path, domain: str) -> None:
     if not database_path.exists():
-        logger.error(f"Database does not exist: {database_path}")
-        console.print(f"[yellow]Run conpass without --show to create the database and start spraying.[/yellow]")
-        raise typer.Exit(code=1)
-
-    console.rule(f'Found Credentials for {domain}')
-
-    # Connect to database
+        msg = f"Database {database_path} does not exist"
+        raise ConfigurationError(msg)
+    database = Database(database_path, domain)
     try:
-        db_service = DatabaseService(database_path, domain)
-        db_service.connect()
-    except Exception as e:
-        logger.error(f"Failed to connect to database: {e}")
-        raise typer.Exit(code=1) from None
-
-    # Get statistics
-    stats = db_service.get_stats()
-    console.print(f"[cyan]Database: {database_path}[/cyan]")
-    console.print(f"[cyan]Total tests: {stats['total']} ({stats['successful']} successful, {stats['failed']} failed)[/cyan]")
-    console.print()
-
-    # Get successful credentials
-    successful_creds = db_service.get_successful_credentials()
-
-    if not successful_creds and not db_service.get_previous_passwords():
-        console.print("[yellow]No credentials found yet.[/yellow]")
-        console.print("[yellow]Run conpass without --show to start testing passwords.[/yellow]")
-        db_service.close()
-        raise typer.Exit(code=0)
-
-    # Display in a table
-    table = Table(title=f"Found Credentials ({len(successful_creds)})")
-    table.add_column("Username", style="cyan")
-    table.add_column("Password", style="green")
-
-    for username, password in sorted(successful_creds):
-        table.add_row(username, password)
-
-    console.print(table)
-    console.print(f"\n[green]✓ Found {len(successful_creds)} valid credential(s)[/green]")
-
-    previous_passwords = db_service.get_previous_passwords()
-    if previous_passwords:
-        table = Table(title=f"Previous Passwords ({len(previous_passwords)})")
-        table.add_column("Username", style="cyan")
-        table.add_column("Previous password", style="magenta")
-        for username, password in sorted(previous_passwords):
-            table.add_row(username, password)
-        console.print(table)
-
-    db_service.close()
-    raise typer.Exit(code=0)
+        print_found_credentials(database, domain)
+    finally:
+        database.close()
 
 
-def _build_credentials(
-    username: str,
-    domain: str,
-    password: str | None,
-    hashes: str | None,
-) -> Credentials:
-    """Build Credentials object from CLI parameters."""
-    return Credentials(
-        username=username,
-        domain=domain,
-        password=password,
-        hashes=hashes,
+def _build_config(options: dict) -> SprayConfig:
+    """Validate the command line options and build the session settings."""
+    credentials = _credentials(options)
+    manual_policy = _manual_policy(options, online=credentials is not None)
+    password_file = options["password_file"]
+    if password_file:
+        _prepare_password_file(password_file)
+    return SprayConfig(
+        domain=options["domain"],
+        credentials=credentials,
+        dc_ip=options["dc_ip"],
+        dns_ip=options["dns_ip"],
+        use_ldaps=options["use_ldaps"],
+        password_file=password_file,
+        user_file=options["user_file"],
+        database_path=_prepare_database(options["database_path"]),
+        user_as_pass=options["user_as_pass"],
+        security_threshold=options["security_threshold"],
+        spray=not options["disable_spray"] and bool(password_file or options["user_as_pass"]),
+        manual_policy=manual_policy,
+        threads=options["threads"],
+        timeout=options["timeout"],
     )
+
+
+def _credentials(options: dict) -> Credentials | None:
+    username, password, hashes = options["username"], options["password"], options["hashes"]
+    if username is None:
+        if password or hashes:
+            msg = "--password and --hashes need --username"
+            raise ConfigurationError(msg)
+        return None
+    if (password is None) == (hashes is None):
+        msg = "Give either --password or --hashes"
+        raise ConfigurationError(msg)
+    try:
+        return Credentials.parse(username, options["domain"], password, hashes)
+    except ValueError as e:
+        raise ConfigurationError(str(e)) from None
+
+
+def _manual_policy(options: dict, online: bool) -> PasswordPolicy | None:
+    threshold, window = options["lockout_threshold"], options["lockout_window"]
+    if online:
+        if threshold is not None or window is not None:
+            msg = "--lockout-threshold and --lockout-observation-window are only used without --username"
+            raise ConfigurationError(msg)
+        return None
+    if options["user_file"] is None or threshold is None or window is None:
+        msg = "Without --username, --user-file, --lockout-threshold and --lockout-observation-window are required"
+        raise ConfigurationError(msg)
+    if 0 < threshold <= options["security_threshold"]:
+        msg = f"The lockout threshold ({threshold}) leaves no attempt above the security threshold"
+        raise ConfigurationError(msg)
+    return PasswordPolicy("Manual policy", threshold, window)
+
+
+def _prepare_password_file(path: Path) -> None:
+    """Create the password file if needed (it is watched), and confirm very long ones."""
+    if not path.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        except OSError as e:
+            msg = f"Cannot create {path}: {e}"
+            raise ConfigurationError(msg) from None
+        success(f"Created {path}: add passwords to it while conpass is running")
+        return
+    count = len(read_lines(path))
+    if count > LARGE_PASSWORD_FILE and not typer.confirm(
+        f"{path} has {count} passwords, spraying them all may take a very long time. Continue?"
+    ):
+        raise typer.Exit(1)
+
+
+def _prepare_database(path: Path) -> Path | None:
+    """Ask before creating the database. Returns None when the user declines it."""
+    if path.exists():
+        return path
+    warning(f"Database {path} does not exist. It records tested credentials, to resume a session.")
+    if not typer.confirm("Create it?", default=True):
+        warning("Tested credentials will not be recorded")
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        msg = f"Cannot create {path.parent}: {e}"
+        raise ConfigurationError(msg) from None
+    return path
