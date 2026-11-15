@@ -77,7 +77,7 @@ class PolicyService:
             'userAccountControl'
         ]
 
-        entries = self.ldap_service.search_users(search_filter, attributes)
+        entries = self.ldap_service.search_users(search_filter, attributes, is_user_filter=bool(user_filter))
         users = []
 
         stats = {

@@ -58,6 +58,7 @@ def spray(
 
     # Debug
     debug: bool = typer.Option(False, "--debug", help="Enable debug messages", rich_help_panel="Spray"),
+    n2_detection_delay: float = typer.Option(1.0, "--n2-detection-delay", help="Seconds to wait after failed auth before re-querying LDAP for N-2 Rule detection", rich_help_panel="Spray"),
 
     # Show credentials
     show_found: bool = typer.Option(False, "--show", help="Show found credentials from database and exit", rich_help_panel="Spray"),
@@ -126,6 +127,7 @@ def spray(
             timeout=timeout,
             limit_memory=limit_memory,
             debug=debug,
+            n2_detection_delay=n2_detection_delay,
         )
     except ValueError as e:
         logger.error(str(e))

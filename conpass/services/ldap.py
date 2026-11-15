@@ -388,13 +388,14 @@ class LdapService:
         """Check if we have permission to read PSO details."""
         return self._can_read_psos
 
-    def search_users(self, search_filter: str, attributes: list[str]) -> list:
+    def search_users(self, search_filter: str, attributes: list[str], is_user_filter: bool = False) -> list:
         """
         Search for users across all domain controllers and return entries with max badPwdCount.
 
         Args:
             search_filter: LDAP search filter
             attributes: List of attributes to retrieve
+            is_user_filter: Whether the search was filtered by a specific user list (-U/--user-file)
 
         Returns:
             List of LDAP entries (with max badPwdCount from all DCs)
@@ -457,7 +458,10 @@ class LdapService:
                         break
 
             # Display final message after spinner disappears
-            self.console.print(f"[green]✓ Loaded {len(entries)} users from LDAP")
+            if is_user_filter:
+                self.console.print(f"[green]✓ Loaded {len(entries)} users matching filter from LDAP")
+            else:
+                self.console.print(f"[green]✓ Loaded {len(entries)} users from LDAP")
         else:
             # No console - load without progress display
             for conn in self._connections:

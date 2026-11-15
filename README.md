@@ -35,6 +35,7 @@ These candidates are:
 ⚠️ **Limitations:**
 - **Offline mode** (`--user-file` without LDAP) cannot detect history candidates — this requires LDAP to read `badPwdCount`
 - **False positives**: `badPwdCount` may also remain unchanged due to DC replication delay, account restrictions, or other factors. Treat candidates as *suspected* matches, not confirmed.
+- **Detection timing**: AD takes a moment to update `badPwdCount` after a failed authentication. conpass waits `--n2-detection-delay` seconds (default: 1s) before re-querying LDAP. Increase this if you see too many false positives, or decrease it to speed up spraying.
 
 ## Installation
 

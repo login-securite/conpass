@@ -34,6 +34,9 @@ class SprayConfig:
     timeout: int = 3
     limit_memory: bool = False
 
+    # N-2 Rule detection delay (seconds to wait after failed auth before re-querying LDAP)
+    n2_detection_delay: float = 1.0
+
     # Debug
     debug: bool = False
 

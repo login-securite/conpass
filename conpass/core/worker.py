@@ -317,6 +317,11 @@ class Worker(threading.Thread):
                 self.ldap_service and
                 status == AuthStatus.INVALID_PASSWORD
             ):
+                # Give AD a moment to update badPwdCount after the failed auth.
+                # Without this delay, LDAP may return the stale value and every
+                # failed attempt would incorrectly look like an N-2 history match.
+                time.sleep(self.config.n2_detection_delay if hasattr(self.config, 'n2_detection_delay') else 1.0)
+
                 self._update_user_from_ldap(user)
                 after_bad_count = user.get_bad_password_count()
 
