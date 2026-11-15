@@ -42,7 +42,7 @@ def spray(
     # Spray settings
     password_file: Path | None = typer.Option(None, "--password-file", "-P", file_okay=True, resolve_path=True, help="File containing passwords to test", autocompletion=complete_path, rich_help_panel="Spray"),
     user_file: Path | None = typer.Option(None, "--user-file", "-U", exists=True, file_okay=True, readable=True, resolve_path=True, help="File containing users to test", autocompletion=complete_path, rich_help_panel="Spray"),
-    database_path: Path | None = typer.Option(None, "--database", "-db", file_okay=True, resolve_path=True, help="SQLite database path to track tested credentials (default: ~/.config/conpass/conpass.db)", autocompletion=complete_path, rich_help_panel="Spray"),
+    database_path: Path | None = typer.Option(get_default_database_path(), "--database", "-db", file_okay=True, resolve_path=True, help="SQLite database path to track tested credentials (default: ~/.config/conpass/conpass.db)", autocompletion=complete_path, rich_help_panel="Spray"),
     user_as_pass: bool = typer.Option(False, "--user-as-pass", "-a", help="Enable user-as-pass for each user", rich_help_panel="Spray"),
     security_threshold: int = typer.Option(2, "--security-threshold", "-s", help="Number of remaining attempts before lockout threshold", rich_help_panel="Spray"),
     disable_spray: bool = typer.Option(False, "--disable-spray", help="Disable password spraying (retrieve PSO details only)", rich_help_panel="Spray"),
