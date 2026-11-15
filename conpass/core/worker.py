@@ -164,6 +164,17 @@ class Worker(threading.Thread):
                 # Capture badPwdCount before authentication attempt
                 before_bad_count = user.get_bad_password_count()
 
+            # Load known n-1 / n-2 history candidates from database into user
+            if self.database_service:
+                try:
+                    known_candidates = self.database_service.get_history_candidates(user.samaccountname)
+                    if known_candidates:
+                        passwords = [pwd for _, pwd in known_candidates]
+                        user.load_history_candidates(passwords)
+                except Exception as e:
+                    if self.debug:
+                        self.console.print(f"[red]⚠️  Worker {self.worker_id}: Failed to load history candidates from database: {e}[/red]")
+
             # Check if we can test this password
             can_test, reason = user.can_test_password(password)
             remaining = user.get_remaining_attempts()
@@ -314,6 +325,14 @@ class Worker(threading.Thread):
                     after_bad_count == before_bad_count
                 ):
                     user.add_history_candidate(password)
+
+                    # Persist history candidate to database
+                    if self.database_service:
+                        try:
+                            self.database_service.record_history_candidate(user.samaccountname, password)
+                        except Exception as e:
+                            if self.debug:
+                                self.console.print(f"[red]⚠️  Worker {self.worker_id}: Failed to record history candidate in database: {e}[/red]")
 
                     self.console.print(
                         f"[yellow]{user.samaccountname} - {password}[/yellow]"

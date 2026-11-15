@@ -144,6 +144,13 @@ class User:
         if password in self._tested_passwords:
             return False, "already_tested"
 
+        # Skip known n-1 / n-2 history candidates - we already know these won't
+        # be the current password (they're previous passwords that trigger the
+        # N-2 rule: authentication fails but badPwdCount is not incremented).
+        # Testing them again wastes attempts that could be used for other passwords.
+        if password in self._history_candidates:
+            return False, "history_candidate"
+
         # Check if password already found
         if self._found_password:
             return False, "password_already_found"
@@ -260,6 +267,15 @@ class User:
         with self._lock:
             self._history_candidates.add(password)
 
+    def load_history_candidates(self, passwords: list[str]) -> None:
+        """Load known n-1 / n-2 history candidates (e.g. from database) into this user.
+
+        Args:
+            passwords: List of passwords that are known history candidates
+        """
+        with self._lock:
+            self._history_candidates.update(passwords)
+
     def get_history_candidates(self) -> list[str]:
         """Get all potential n-1 / n-2 password history matches."""
         with self._lock:
@@ -274,6 +290,7 @@ class User:
                 f"  Bad Password Count: {self._bad_password_count}\n"
                 f"  Remaining Attempts: {self.get_remaining_attempts()}\n"
                 f"  Tested Passwords: {len(self._tested_passwords)}\n"
+                f"  History Candidates: {len(self._history_candidates)}\n"
                 f"  Status: {self._status.value}\n"
                 f"  Found Password: {'Yes' if self._found_password else 'No'}"
             )

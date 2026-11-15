@@ -18,6 +18,8 @@ class DatabaseService:
         self._cache: set[tuple[str, str]] = set()  # In-memory cache of tested credentials
         self._cache_lock = threading.Lock()  # Lock for thread-safe cache access
         self._write_lock = threading.Lock()  # Lock for serializing database writes
+        self._history_candidates_cache: set[tuple[str, str]] = set()  # In-memory cache of n-1/n-2 history candidates
+        self._history_cache_lock = threading.Lock()  # Lock for thread-safe history candidate cache access
 
     def connect(self) -> None:
         """
@@ -68,10 +70,28 @@ class DatabaseService:
             CREATE INDEX IF NOT EXISTS idx_{self.table_name}_username_password
             ON {self.table_name}(username, password)
         """)
+
+        # Create table for n-1 / n-2 password history candidates
+        # These are passwords that failed authentication without incrementing badPwdCount,
+        # which indicates they may match one of the two most recently used historical passwords.
+        history_table = f"{self.table_name}_history_candidates"
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {history_table} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                UNIQUE(username, password)
+            )
+        """)
+        cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_{history_table}_username_password
+            ON {history_table}(username, password)
+        """)
         self._connection.commit()
 
     def _load_cache(self) -> None:
-        """Load all tested credentials from database into memory cache."""
+        """Load all tested credentials and history candidates from database into memory cache."""
         if not self._connection:
             return
 
@@ -79,6 +99,16 @@ class DatabaseService:
         cursor.execute(f"SELECT username, password FROM {self.table_name}")
         with self._cache_lock:
             self._cache = {(row[0], row[1]) for row in cursor.fetchall()}
+
+        # Load history candidates into cache
+        history_table = f"{self.table_name}_history_candidates"
+        try:
+            cursor.execute(f"SELECT username, password FROM {history_table}")
+            with self._history_cache_lock:
+                self._history_candidates_cache = {(row[0], row[1]) for row in cursor.fetchall()}
+        except sqlite3.OperationalError:
+            # Table might not exist yet (older database)
+            pass
 
     def is_already_tested(self, username: str, password: str) -> bool:
         """
@@ -153,6 +183,70 @@ class DatabaseService:
                     (int(success), timestamp, username, password)
                 )
                 self._connection.commit()
+
+    def record_history_candidate(self, username: str, password: str) -> None:
+        """Record a potential n-1 / n-2 password history candidate.
+        These are passwords that failed authentication without incrementing badPwdCount,
+        suggesting they match one of the two most recently used historical passwords.
+
+        Args:
+            username: The username
+            password: The potential history match password
+        """
+        if not self._connection:
+            return
+
+        # Add to cache first
+        with self._history_cache_lock:
+            self._history_candidates_cache.add((username, password))
+
+        # Serialize database writes
+        with self._write_lock:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            cursor = self._connection.cursor()
+            history_table = f"{self.table_name}_history_candidates"
+
+            try:
+                cursor.execute(
+                    f"INSERT INTO {history_table} (username, password, detected_at) VALUES (?, ?, ?)",
+                    (username, password, timestamp)
+                )
+                self._connection.commit()
+            except sqlite3.IntegrityError:
+                # Already recorded, update timestamp
+                cursor.execute(
+                    f"UPDATE {history_table} SET detected_at = ? WHERE username = ? AND password = ?",
+                    (timestamp, username, password)
+                )
+                self._connection.commit()
+
+    def is_history_candidate(self, username: str, password: str) -> bool:
+        """Check if a username/password combination is a known n-1 / n-2 history candidate.
+        Uses in-memory cache for O(1) lookup performance.
+
+        Args:
+            username: The username to check
+            password: The password to check
+
+        Returns:
+            True if the combination is a known history candidate
+        """
+        with self._history_cache_lock:
+            return (username, password) in self._history_candidates_cache
+
+    def get_history_candidates(self, username: str | None = None) -> list[tuple[str, str]]:
+        """Get all n-1 / n-2 password history candidates, optionally filtered by username.
+
+        Args:
+            username: Optional username to filter by
+
+        Returns:
+            List of (username, password) tuples
+        """
+        with self._history_cache_lock:
+            if username:
+                return [(u, p) for u, p in self._history_candidates_cache if u == username]
+            return list(self._history_candidates_cache)
 
     def get_tested_credentials(self) -> list[tuple[str, str, bool]]:
         """

@@ -14,6 +14,28 @@ Python tool for continuous password spraying taking into account the password po
 
 Although this tool implements robust thread-safe anti-lockout protection, there can still be edge cases where accounts might be locked out. Always use with caution in production environments.
 
+## N-1 / N-2 Password History Rule
+
+ConPass implements detection of Active Directory's **N-2 Rule** behavior:
+
+> When a user attempts to authenticate with either of their two most recently used historical passwords (n-1 or n-2), authentication fails but the `badPwdCount` attribute is **not incremented**. This avoids punishing users who accidentally try to authenticate with a recently changed password.
+
+### How it works
+
+1. Before each authentication attempt, ConPass reads `badPwdCount` from LDAP
+2. After a failed authentication, it re-reads `badPwdCount`
+3. If `badPwdCount` is unchanged, the password is flagged as a **potential n-1/n-2 history match**
+
+These candidates are:
+- Displayed in yellow with `(potential history match)` during the spray
+- Persisted to the SQLite database (if `--database` is used)
+- Shown in an end-of-run summary table
+- Skipped in subsequent runs (they're known to be previous passwords, not the current one)
+
+⚠️ **Limitations:**
+- **Offline mode** (`--user-file` without LDAP) cannot detect history candidates — this requires LDAP to read `badPwdCount`
+- **False positives**: `badPwdCount` may also remain unchanged due to DC replication delay, account restrictions, or other factors. Treat candidates as *suspected* matches, not confirmed.
+
 ## Installation
 
 **conpass** works with python >= 3.10

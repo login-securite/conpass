@@ -568,6 +568,57 @@ class SprayOrchestrator:
 
         self.console.print("[green]Spray completed![/green]")
 
+        # Display n-1 / n-2 history candidate summary
+        self._display_history_candidates_summary()
+
+    def _display_history_candidates_summary(self) -> None:
+        """Display end-of-run summary of detected n-1 / n-2 password history candidates.
+        
+        These are passwords that failed authentication without incrementing badPwdCount,
+        which suggests they match one of the two most recently used historical passwords
+        (Active Directory N-2 Rule behavior).
+        
+        ⚠️  False positive warning: A unchanged badPwdCount can also occur due to
+        domain controller replication delay, account restrictions, or other factors.
+        History candidates should be treated as suspected n-1/n-2 matches, not confirmed.
+        """
+        if not self.database_service:
+            return
+
+        all_candidates = self.database_service.get_history_candidates()
+        if not all_candidates:
+            return
+
+        self.console.print()
+        self.console.rule("[bold yellow]N-1 / N-2 Password History Candidates[/bold yellow]")
+        self.console.print(
+            "[yellow]The following passwords failed authentication without incrementing badPwdCount,[/yellow]"
+        )
+        self.console.print(
+            "[yellow]which is consistent with Active Directory's N-2 Rule behavior (n-1 / n-2 history match).[/yellow]"
+        )
+        self.console.print()
+
+        from rich.table import Table
+
+        table = Table(show_header=True, header_style="bold yellow")
+        table.add_column("Username", style="cyan")
+        table.add_column("Password", style="yellow")
+        table.add_column("Status", style="bright_black")
+
+        for username, password in sorted(all_candidates):
+            table.add_row(username, password, "potential history match")
+
+        self.console.print(table)
+        self.console.print()
+        self.console.print(
+            "[bright_black]⚠️  Note: Offline mode cannot detect history candidates (requires LDAP to read badPwdCount).[/bright_black]"
+        )
+        self.console.print(
+            "[bright_black]   False positives possible: unchanged badPwdCount can also result from DC replication delay.[/bright_black]"
+        )
+        self.console.print()
+
     def _read_new_passwords(self, seen_passwords: set) -> list[str]:
         """Read password file and return only new passwords not in seen_passwords."""
         new_passwords = []
