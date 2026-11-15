@@ -46,7 +46,8 @@ class Worker(threading.Thread):
         database_service: DatabaseService | None = None,
         completed_count_ref: tuple = None,
         connected_workers_ref: tuple = None,
-        debug: bool = False
+        debug: bool = False,
+        n2_detection_delay: float = 1.0
     ):
         super().__init__(daemon=True)
         self.worker_id = worker_id
@@ -59,6 +60,7 @@ class Worker(threading.Thread):
         self.stop_event = stop_event
         self.lockout_event = lockout_event
         self.debug = debug
+        self.n2_detection_delay = n2_detection_delay
 
         # Progress tracking
         if completed_count_ref:
@@ -320,7 +322,7 @@ class Worker(threading.Thread):
                 # Give AD a moment to update badPwdCount after the failed auth.
                 # Without this delay, LDAP may return the stale value and every
                 # failed attempt would incorrectly look like an N-2 history match.
-                time.sleep(self.config.n2_detection_delay if hasattr(self.config, 'n2_detection_delay') else 1.0)
+                time.sleep(self.n2_detection_delay)
 
                 self._update_user_from_ldap(user)
                 after_bad_count = user.get_bad_password_count()

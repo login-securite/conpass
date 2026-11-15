@@ -409,7 +409,8 @@ class SprayOrchestrator:
                 database_service=self.database_service,
                 completed_count_ref=(self, 'completed_count', 'completed_lock'),
                 connected_workers_ref=(self, 'connected_workers', 'connected_workers_lock'),
-                debug=self.config.debug
+                debug=self.config.debug,
+                n2_detection_delay=self.config.n2_detection_delay,
             )
 
             worker.start()
