@@ -41,11 +41,13 @@ def load_from_ldap(client: LdapClient, config: SprayConfig) -> Targets:
     default policy. So are users whose lockout threshold leaves no attempt.
     """
     policies = [client.default_policy(), *client.password_settings_objects()]
+    names = read_lines(config.user_file) if config.user_file else None
+    wanted = {name.lower() for name in names} if names is not None else None
     with console.status("Loading users over LDAP..."):
-        entries = client.enabled_users()
+        # With a user file, only those accounts are requested from the DC, instead
+        # of pulling every enabled user of the domain and filtering afterwards.
+        entries = client.enabled_users(names)
     success(f"✓ {len(entries)} enabled users found")
-
-    wanted = {name.lower() for name in read_lines(config.user_file)} if config.user_file else None
     by_name = {policy.name: policy for policy in policies}
     targets = Targets([], policies)
     skipped: Counter = Counter()

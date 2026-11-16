@@ -76,3 +76,54 @@ def test_database_roundtrip(tmp_path):
     assert database.stats() == (2, 1)
     database.close()
     assert Database(tmp_path / "conpass.db", "hackn.lab").is_tested("alice", "Password1")
+
+
+def test_escape_filter_value():
+    from conpass.protocols.ldap import escape_filter_value
+
+    assert escape_filter_value("alice") == "alice"
+    assert escape_filter_value("a*b(c)\\d") == "a\\2ab\\28c\\29\\5cd"
+
+
+def _client_capturing_filters(filters):
+    from conpass.protocols.ldap import LdapClient
+
+    client = LdapClient.__new__(LdapClient)
+    client.base_dn = "DC=hackn,DC=lab"
+    client.search = lambda base, search_filter, attributes, **kwargs: (  # type: ignore[attr-defined]
+        filters.append(search_filter) or []
+    )
+    return client
+
+
+def test_enabled_users_without_file_pulls_whole_domain():
+    from conpass.protocols.ldap import ENABLED_USERS_FILTER
+
+    filters: list[str] = []
+    client = _client_capturing_filters(filters)
+    client.enabled_users()
+    assert filters == [ENABLED_USERS_FILTER]
+
+
+def test_enabled_users_with_file_only_targets_those_names():
+    filters: list[str] = []
+    client = _client_capturing_filters(filters)
+    client.enabled_users(["alice", "bob", "alice"])  # duplicate is collapsed
+    assert len(filters) == 1
+    assert filters[0] == (
+        "(&(&(objectCategory=person)(objectClass=user)(!(sAMAccountName=*$))"
+        "(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+        "(|(sAMAccountName=alice)(sAMAccountName=bob)))"
+    )
+
+
+def test_enabled_users_chunks_large_file():
+    from conpass.protocols.ldap import NAME_FILTER_CHUNK
+
+    filters: list[str] = []
+    client = _client_capturing_filters(filters)
+    names = [f"user{i}" for i in range(NAME_FILTER_CHUNK + 1)]
+    client.enabled_users(names)
+    assert len(filters) == 2
+    assert filters[0].count("(sAMAccountName=user") == NAME_FILTER_CHUNK
+    assert filters[1].count("(sAMAccountName=user") == 1

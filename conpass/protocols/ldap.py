@@ -26,6 +26,9 @@ from conpass.timeutils import filetime_to_datetime, interval_to_seconds
 
 SCHEME_PORTS = {"ldap": 389, "ldaps": 636}
 PAGE_SIZE = 1000
+# Max sAMAccountNames per LDAP filter: keeps a targeted search well under the
+# server's filter-size limit when a large --user-file is given.
+NAME_FILTER_CHUNK = 500
 
 UF_ACCOUNTDISABLE = 0x2
 UF_LOCKOUT = 0x10
@@ -72,6 +75,13 @@ class LdapEntry:
 def domain_to_dn(domain: str) -> str:
     """hackn.lab -> DC=hackn,DC=lab"""
     return ",".join(f"DC={part}" for part in domain.split("."))
+
+
+def escape_filter_value(value: str) -> str:
+    """Escape a value for use in an LDAP filter (RFC 4515)."""
+    for char, replacement in (("\\", "\\5c"), ("*", "\\2a"), ("(", "\\28"), (")", "\\29"), ("\x00", "\\00")):
+        value = value.replace(char, replacement)
+    return value
 
 
 def parse_lockout_state(entry: LdapEntry) -> LockoutState:
@@ -334,14 +344,26 @@ class LdapClient:
             for entry in entries
         ]
 
-    def enabled_users(self) -> list[LdapEntry]:
-        """Enabled user accounts, with their resultant PSO and lockout attributes."""
-        return self.search(
-            self.base_dn,
-            ENABLED_USERS_FILTER,
-            ["sAMAccountName", "msDS-ResultantPSO", *LOCKOUT_ATTRIBUTES],
-            paged=True,
-        )
+    def enabled_users(self, sam_names: Sequence[str] | None = None) -> list[LdapEntry]:
+        """
+        Enabled user accounts, with their resultant PSO and lockout attributes.
+
+        When sam_names is given, only those accounts are requested from the DC
+        (server-side filter), so a 3-name user file never pulls the whole domain.
+        None requests every enabled user.
+        """
+        attributes = ["sAMAccountName", "msDS-ResultantPSO", *LOCKOUT_ATTRIBUTES]
+        if sam_names is None:
+            return self.search(self.base_dn, ENABLED_USERS_FILTER, attributes, paged=True)
+
+        entries: list[LdapEntry] = []
+        names = list(dict.fromkeys(sam_names))
+        for start in range(0, len(names), NAME_FILTER_CHUNK):
+            chunk = names[start : start + NAME_FILTER_CHUNK]
+            clauses = "".join(f"(sAMAccountName={escape_filter_value(name)})" for name in chunk)
+            search_filter = f"(&{ENABLED_USERS_FILTER}(|{clauses}))"
+            entries.extend(self.search(self.base_dn, search_filter, attributes, paged=True))
+        return entries
 
     def read_user_state(self, dn: str) -> LockoutState | None:
         """
