@@ -86,6 +86,8 @@ class PolicyService:
             'locked': 0,
             'pso_users': {},
             'discarded_low_threshold': 0,
+            'discarded_unreadable_pso': 0,
+            'discarded_unreadable_pso_names': {},
         }
 
         for entry in entries:
@@ -111,6 +113,10 @@ class PolicyService:
 
                 # Skip if we can't read PSO details
                 if not self.ldap_service.can_read_pso():
+                    stats['discarded_unreadable_pso'] += 1
+                    stats['discarded_unreadable_pso_names'][pso_name] = (
+                        stats['discarded_unreadable_pso_names'].get(pso_name, 0) + 1
+                    )
                     continue
 
             # Skip current user (the one running the tool)
@@ -181,6 +187,13 @@ class PolicyService:
         """Print user statistics to console."""
         from rich.table import Table
 
+        # Warn about users discarded because their PSO could not be read
+        for pso_name, count in stats.get('discarded_unreadable_pso_names', {}).items():
+            self.console.print(
+                f"[yellow]Discarded {count} user(s) protected by PSO '{pso_name}': "
+                "unable to read PSO details (lockout threshold unknown)[/yellow]"
+            )
+
         # Bad password count distribution
         badpwd_counts = {}
         for user in users:
@@ -194,3 +207,18 @@ class PolicyService:
             for count in sorted(badpwd_counts.keys()):
                 table.add_row(str(count), str(badpwd_counts[count]))
             self.console.print(table)
+
+        # Make it obvious when filtering removed every user
+        if not users:
+            self.console.print("[red]No users to spray after filtering.[/red]")
+            reasons = []
+            if stats.get('disabled'):
+                reasons.append(f"{stats['disabled']} disabled")
+            if stats.get('locked'):
+                reasons.append(f"{stats['locked']} locked")
+            if stats.get('discarded_low_threshold'):
+                reasons.append(f"{stats['discarded_low_threshold']} below lockout threshold")
+            if stats.get('discarded_unreadable_pso'):
+                reasons.append(f"{stats['discarded_unreadable_pso']} with unreadable PSO")
+            if reasons:
+                self.console.print("[yellow]Discarded: " + ", ".join(reasons) + "[/yellow]")
