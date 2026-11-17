@@ -254,6 +254,9 @@ class Orchestrator:
                 if scheduler.is_done():
                     if not self.config.password_file:
                         break
+                    if scheduler.active_users == 0:
+                        warning("No users left to spray — nothing else to test")
+                        break
                     if not idle_announced:
                         idle_announced = True
                         success("All passwords tested. Watching the password file for new ones (Ctrl+C to quit)")

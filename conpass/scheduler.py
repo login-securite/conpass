@@ -139,6 +139,12 @@ class Scheduler:
         with self._cond:
             return self._busy == 0 and not self._ready and not self._waiting
 
+    @property
+    def active_users(self) -> int:
+        """Number of users still being sprayed (not finished or dropped)."""
+        with self._cond:
+            return self._active
+
     def waiting_count(self) -> int:
         """Number of users waiting for their observation window or lockout to end."""
         with self._cond:
